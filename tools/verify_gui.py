@@ -18,6 +18,7 @@ import argparse
 import shutil
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -357,11 +358,53 @@ def test_redo_needs_a_run_folder(driver: Driver) -> None:
     tab.override_quality_var.set("35")
     infos.clear()
     tab.reencode_selected()
-    driver.pump()
+    check(tab.redo_worker is not None, "the re-do went to a worker, not the UI thread")
+    while tab.busy():
+        driver.pump(0.05)
+    driver.pump(0.3)
     tab.override_quality_var.set("")
     after = target.stat().st_size if target.is_file() else None
     check(not infos and after is not None and after != before,
           f"a re-do after Start still works ({before} -> {after} bytes, dialogs: {infos})")
+
+    # Proof it is really off the UI thread rather than merely wrapped in one:
+    # hold the task open and check the event loop still turns.  Decoding a
+    # full-size photo takes seconds, and on the UI thread the window would be
+    # frozen for every one of them.
+    entered, release = threading.Event(), threading.Event()
+    real_task = tab.redo_task
+
+    def slow_task(job, long_edge, quality):
+        inner = real_task(job, long_edge, quality)
+
+        def run():
+            entered.set()
+            release.wait(10)
+            return inner()
+
+        return run
+
+    tab.redo_task = slow_task
+    tab.tree.selection_set(row)
+    tab.reencode_selected()
+    check(entered.wait(10), "the held re-do actually started")
+    spins = 0
+    while spins < 5:
+        driver.app.update()  # would never return if the work were on this thread
+        spins += 1
+    check(spins == 5, "the event loop keeps turning while a re-do is working")
+    check(tab.busy(), "the tab reports itself busy during a re-do")
+    check(str(tab.redo_button["state"]) == "disabled",
+          "the Re-do button is disabled while one is in flight")
+    tab.start()  # must be refused: a batch would race the re-do's own output
+    check(not (tab.worker and tab.worker.is_alive()),
+          "Start is refused while a re-do is in flight")
+    release.set()
+    while tab.busy():
+        driver.pump(0.05)
+    driver.pump(0.3)
+    tab.redo_task = real_task
+    check(str(tab.redo_button["state"]) == "normal", "the Re-do button comes back")
     return [plan]
 
 

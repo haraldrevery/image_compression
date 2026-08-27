@@ -297,6 +297,17 @@ def test_cap_and_passthrough(tmp: Path, out: Path) -> None:
     check(r.output.is_file() and r.byte_size > 40_000,
           "an over-cap file must still be written")
     check(r.quality == 40, f"over-cap result should sit at the floor, got q{r.quality}")
+    check("quality floor 40" in r.notes,
+          f"the note should blame the floor the search actually reached: {r.notes!r}")
+
+    # A per-image override skips the search, so the note must name the quality
+    # the file really was encoded at rather than a floor it never went near.
+    r = convert.convert(noisy, out / "cap-over-override.jpg", tight, quality=95)
+    print(f"  override q95: {r.kilobytes:.1f} KB q{r.quality} notes={r.notes!r}")
+    check(r.quality == 95, f"the override quality should be used, got q{r.quality}")
+    check(r.over_cap, "an over-cap override should still be flagged")
+    check("95" in r.notes and "floor" not in r.notes,
+          f"the note names q95, not a quality floor: {r.notes!r}")
 
     # passthrough: a JPEG already inside both limits
     small = Image.fromarray(rng.integers(0, 256, (400, 600, 3), dtype=np.uint8))
@@ -505,6 +516,30 @@ def test_scanner(tmp: Path) -> None:
           "non-image files should be copied across")
     check([d.name for d in result.empty_dirs] == ["empty"],
           f"the empty subfolder should be mirrored, got {result.empty_dirs}")
+
+    # This app's own finished thumbnails are not source material for it either:
+    # re-encoding a 70 KB _min.jpg at quality 65 only costs a second generation.
+    # They ride along as copies, so the mirror is still complete.
+    mixed = tmp / "scan-mixed"
+    (mixed / "sub").mkdir(parents=True)
+    tiny = Image.fromarray(
+        np.random.default_rng(14).integers(0, 256, (60, 80, 3), dtype=np.uint8)
+    )
+    for name in ("photo.jpg", "photo_min.jpg", "sub/nested_min.jpg"):
+        tiny.save(mixed / name)
+    mixed_run = tmp / "scan-out" / "mixed"
+    mixed_result = scanner.scan_compress(mixed, mixed_run, ConvertSettings())
+    actions = {
+        str(job.output.relative_to(mixed_run)): job.action for job in mixed_result.jobs
+    }
+    print(f"  _min inputs: {actions}")
+    check(actions.get("photo.jpg") == scanner.PROCESS,
+          f"a normal photo is still compressed, got {actions.get('photo.jpg')}")
+    check(actions.get("photo_min.jpg") == scanner.COPY,
+          f"an existing _min.jpg must be copied, not re-encoded: {actions.get('photo_min.jpg')}")
+    check(actions.get("sub/nested_min.jpg") == scanner.COPY,
+          "the never-compress-the-compressed rule applies in subfolders too")
+    check(len(actions) == 3, f"no file was dropped from the mirror: {sorted(actions)}")
 
     # non-recursive must not promise folders it never looked in
     shallow = scanner.scan_compress(root, run, ConvertSettings(recursive=False))

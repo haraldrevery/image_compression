@@ -240,9 +240,16 @@ def convert(
     if converted_colour:
         notes.append("converted to sRGB")
     if over_cap:
+        # An override skips the search entirely, so blaming the quality floor
+        # would name a quality the file was never encoded at.
+        reason = (
+            f"at the quality {used_quality} you asked for"
+            if quality is not None
+            else f"even at the quality floor {settings.quality_floor}"
+        )
         notes.append(
-            f"{len(data) / 1024:.1f} KB exceeds the {settings.max_size / 1024:.1f} KB cap "
-            f"at quality floor {settings.quality_floor}"
+            f"{len(data) / 1024:.1f} KB exceeds the "
+            f"{settings.max_size / 1024:.1f} KB cap {reason}"
         )
     return ConvertResult(
         source, output, source_size, size, len(data), used_quality,

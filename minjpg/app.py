@@ -183,8 +183,12 @@ class ThumbnailTab(FolderTab):
     def run_one(self, job: scanner.Job):
         return pipeline.compress(job.source, job.output, self.app.settings)
 
-    def redo_one(self, job: scanner.Job, long_edge, quality):
-        return pipeline.compress(job.source, job.output, self.app.settings, long_edge, quality)
+    def redo_task(self, job: scanner.Job, long_edge, quality):
+        # A plain dataclass, so the worker can read it; nothing Tk-owned here.
+        settings = self.app.settings
+        return lambda: pipeline.compress(
+            job.source, job.output, settings, long_edge, quality
+        )
 
     def describe_result(self, result) -> tuple[str, str]:
         status = "at floor" if result.hit_quality_floor else "done"
@@ -309,9 +313,12 @@ class CompressTab(FolderTab):
     def run_one(self, job: scanner.Job):
         return convert.convert(job.source, job.output, self.app.convert_settings)
 
-    def redo_one(self, job: scanner.Job, long_edge, quality):
-        return convert.convert(
-            job.source, job.output, self.current_settings(), long_edge, quality
+    def redo_task(self, job: scanner.Job, long_edge, quality):
+        # current_settings() reads the entry widgets, so it has to happen on the
+        # UI thread and be closed over rather than called from the worker.
+        settings = self.current_settings()
+        return lambda: convert.convert(
+            job.source, job.output, settings, long_edge, quality
         )
 
     def describe_result(self, result) -> tuple[str, str]:
@@ -528,7 +535,11 @@ class MinJpgApp(Tk):
             if not messagebox.askokcancel("Quit", "Work is still running. Stop and quit?"):
                 return
             for tab in busy:
-                tab.worker.cancelled.set()
+                # A tab can be busy on a single-image re-do instead, which has
+                # no batch to cancel — it is one atomic write and will be gone
+                # with the process.
+                if tab.worker:
+                    tab.worker.cancelled.set()
         self.settings.last_folder = self.thumbnail_tab.input_var.get().strip()
         self.settings.output_parent = self.thumbnail_tab.output_var.get().strip()
         try:

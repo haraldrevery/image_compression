@@ -394,6 +394,12 @@ def scan_compress(
     The run folder becomes a full mirror of the input: every image is replaced
     by its compressed JPEG, and everything else is copied across untouched, so
     nothing in the tree is lost on the way.
+
+    ``_min.jpg`` files are the one exception.  They are this app's own finished
+    thumbnails, already far inside any cap here, so re-encoding one only spends
+    a second generation of loss on it for no gain — the same "never compress the
+    compressed" rule :func:`scan_min` follows.  They ride along as copies
+    instead, which keeps the mirror complete.
     """
     check_folders(input_folder, run_root)
     return scan_spec(
@@ -404,7 +410,7 @@ def scan_compress(
             output_name=plain_jpg_name,
             recursive=settings.recursive,
             force=settings.force,
-            exclude_min=False,
+            exclude_min=True,  # copied across instead, see above
             copy_sources=False,  # the compressed JPEG replaces the original
             copy_extras=True,
         )

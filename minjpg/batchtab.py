@@ -124,6 +124,10 @@ class BatchTab(ttk.Frame):
         self.app = app
         self.events: queue.Queue = queue.Queue()
         self.worker: Worker | None = None
+        # A re-do of a single image, also off the UI thread.  Never runs at the
+        # same time as a batch: busy() covers both, and every entry point that
+        # matters checks it.
+        self.redo_worker: threading.Thread | None = None
         self.scan_result: scanner.ScanResult | None = None
         self.run_plan: runfolder.RunPlan | None = None
         # Everything that shaped the current job list, captured when it was
@@ -248,9 +252,15 @@ class BatchTab(ttk.Frame):
     def run_one(self, job: scanner.Job) -> ResultLike:
         raise NotImplementedError
 
-    def redo_one(
+    def redo_task(
         self, job: scanner.Job, long_edge: int | None, quality: int | None
-    ) -> ResultLike:
+    ) -> Callable[[], ResultLike]:
+        """Build the callable that re-does one image.
+
+        Called on the UI thread; the callable it returns is run on a worker.
+        Anything Tk owns — a ``StringVar``, a widget — has to be read *here* and
+        closed over, because touching Tk from another thread is undefined.
+        """
         raise NotImplementedError
 
     def describe_result(self, result: ResultLike) -> tuple[str, str]:
@@ -357,9 +367,10 @@ class BatchTab(ttk.Frame):
         ttk.Entry(override, textvariable=self.override_quality_var, width=8).grid(
             row=0, column=3, padx=(4, 12)
         )
-        ttk.Button(override, text="Re-do selected", command=self.reencode_selected).grid(
-            row=0, column=4
+        self.redo_button = ttk.Button(
+            override, text="Re-do selected", command=self.reencode_selected
         )
+        self.redo_button.grid(row=0, column=4)
         ttk.Label(
             override,
             text="Blank = use settings. Quality skips the search and encodes once.",
@@ -489,7 +500,7 @@ class BatchTab(ttk.Frame):
         return True
 
     def start(self) -> None:
-        if self.worker and self.worker.is_alive():
+        if self.busy():
             return
         if not self.ensure_ready():
             return
@@ -602,17 +613,29 @@ class BatchTab(ttk.Frame):
             messagebox.showerror("Invalid override", "Long edge must be at least 16 px.")
             return
 
+        # Decoding and resizing a full-size photo takes seconds, and doing it
+        # here would freeze the whole window — Tk cannot repaint while a
+        # callback is running, so the app reads as hung.  Same treatment as a
+        # batch: off to a thread, back through the event queue.
         try:
-            result = self.redo_one(job, long_edge, quality)
-        except Exception as exc:
-            self.tree.set(iid, "status", "failed")
-            self.tree.item(iid, tags=("failed",))
-            self.append_log(f"FAILED {job.source.name}: {exc}")
+            task = self.redo_task(job, long_edge, quality)
+        except scanner.ScanError as exc:
             messagebox.showerror("Re-do failed", str(exc))
             return
 
-        self.record_result(iid, result)
-        self._render_preview()
+        def work() -> None:
+            try:
+                result = task()
+            except Exception as exc:  # reported on the UI thread, not here
+                self.events.put(("redo_failed", iid, job.source, str(exc)))
+            else:
+                self.events.put(("redone", iid, result))
+
+        self.redo_button.configure(state="disabled")
+        self.tree.set(iid, "status", "working")
+        self.progress_var.set(f"re-doing {job.source.name[:24]}")
+        self.redo_worker = threading.Thread(target=work, daemon=True)
+        self.redo_worker.start()
 
     # -------------------------------------------------------------- events
 
@@ -644,6 +667,8 @@ class BatchTab(ttk.Frame):
                 self.tree.set(iid, "status", "failed")
                 self.tree.item(iid, tags=("failed",))
             self.append_log(f"FAILED {Path(source).name}: {message}")
+        elif kind in ("redone", "redo_failed"):
+            self._finish_redo(event)
         elif kind == "finished":
             done, failed, cancelled = event[1], event[2], event[3]
             self.progress.configure(value=self.progress["maximum"])
@@ -654,6 +679,23 @@ class BatchTab(ttk.Frame):
                 f"{'Cancelled' if cancelled else 'Finished'}: {done} written, {failed} failed"
             )
             self._tidy_run_folder(done)
+
+    def _finish_redo(self, event: tuple) -> None:
+        """Land a finished re-do back on the UI thread."""
+        self.redo_button.configure(state="normal")
+        self.progress_var.set("")
+        iid = event[1]
+        if iid not in self.rows:
+            return  # the list was rebuilt underneath it; nothing to update
+        if event[0] == "redone":
+            self.record_result(iid, event[2])
+            self._render_preview()
+            return
+        source, message = event[2], event[3]
+        self.tree.set(iid, "status", "failed")
+        self.tree.item(iid, tags=("failed",))
+        self.append_log(f"FAILED {Path(source).name}: {message}")
+        messagebox.showerror("Re-do failed", message)
 
     def _tidy_run_folder(self, done: int) -> None:
         """Leave nothing behind when a run wrote nothing.
@@ -751,7 +793,10 @@ class BatchTab(ttk.Frame):
         self.log.configure(state="disabled")
 
     def busy(self) -> bool:
-        return bool(self.worker and self.worker.is_alive())
+        return bool(
+            (self.worker and self.worker.is_alive())
+            or (self.redo_worker and self.redo_worker.is_alive())
+        )
 
     @staticmethod
     def int_field(parent: ttk.Frame, label: str, var: StringVar, width: int = 8) -> None:
