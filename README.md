@@ -360,8 +360,8 @@ MozJPEG is BSD/IJG licensed; see `vendor/LICENSE.mozjpeg.md`.
 ## Verifying
 
 ```bash
-.venv/bin/python tools/verify_convert.py              # 133 checks
-.venv/bin/python tools/verify_gui.py                  # 28 checks, needs a display
+.venv/bin/python tools/verify_convert.py              # 135 checks
+.venv/bin/python tools/verify_gui.py                  # 60 checks, needs a display
 .venv/bin/python tools/verify_against_examples.py --all   # _min: all 197 pairs
 ```
 
@@ -376,8 +376,10 @@ source tree is byte-for-byte unchanged after a run of each mode.
 act until both folders are named, runs every layout, and then asserts the input
 tree is byte-for-byte and mtime unchanged, that repeat runs step aside with a
 suffix instead of overwriting, that Start's dialog names the folder it is about
-to create, that editing a folder after Scan blocks Start, and that a run which
-writes nothing removes its own empty folder. It skips itself without a display.
+to create, that editing a folder *or any option* after Scan blocks Start, that
+"Re-do selected" cannot create the run folder before Start has confirmed it, and
+that a run which writes nothing removes its own empty folder. It skips itself
+without a display.
 
 This compresses real originals from `../example_data` and prints the result
 next to the hand-made Squoosh `_min.jpg`, asserting every generated file is

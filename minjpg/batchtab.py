@@ -126,6 +126,9 @@ class BatchTab(ttk.Frame):
         self.worker: Worker | None = None
         self.scan_result: scanner.ScanResult | None = None
         self.run_plan: runfolder.RunPlan | None = None
+        # Everything that shaped the current job list, captured when it was
+        # built.  Compared against the live controls before Start.
+        self._scan_state: tuple | None = None
         self.rows: dict[str, scanner.Job] = {}
         self.results: dict[str, ResultLike] = {}
         # Source path -> row id.  A linear search per event made progress
@@ -167,6 +170,17 @@ class BatchTab(ttk.Frame):
     def output_parent(self) -> Path | None:
         """The folder the run folder goes inside, or ``None`` if not set."""
         raise NotImplementedError
+
+    def scan_state(self) -> tuple:
+        """Every control that decides what a run does, as it stands right now.
+
+        Captured at Scan and compared again at Start.  A control that changes
+        the job list — or the settings the jobs are run with — must appear here,
+        or ticking it would silently do nothing for that run.  Raw widget values
+        rather than parsed ones: a half-typed number still counts as a change,
+        and comparing text cannot raise.
+        """
+        return (self.input_folder(), self.output_parent())
 
     def plan_run_folder(self) -> runfolder.RunPlan:
         """Reserve a name for the next run. Creates nothing on disk."""
@@ -401,6 +415,9 @@ class BatchTab(ttk.Frame):
 
     def _show_scan(self, result: scanner.ScanResult) -> None:
         self.scan_result = result
+        # Read *after* the scan: perform_scan is what folds the widgets into the
+        # settings objects, so before it the two would not agree.
+        self._scan_state = self.scan_state()
         self.tree.delete(*self.tree.get_children())
         self.rows.clear()
         self.results.clear()
@@ -435,17 +452,20 @@ class BatchTab(ttk.Frame):
         self.progress_var.set("")
 
     def scan_is_stale(self) -> bool:
-        """Have the folder fields moved on since the scan that built this list?
+        """Have the controls moved on since the scan that built this list?
 
-        Starting then would run the jobs from the old folders while the header
-        describes the new ones — the user would be told one thing and given
-        another.  A re-scan is cheap; guessing is not.
+        Starting then would run the old jobs while the controls describe
+        different ones — untick "Include subfolders" after a scan and the
+        subfolders would still be processed, with nothing to say so.  Folders
+        are checked against the scan result itself; everything else through
+        :meth:`scan_state`.  A re-scan is cheap; guessing is not.
         """
         if self.scan_result is None or self.run_plan is None:
             return True
         return (
             self.input_folder() != self.scan_result.root
             or self.output_parent() != self.run_plan.parent
+            or self.scan_state() != self._scan_state
         )
 
     def _refresh_plan(self) -> bool:
@@ -481,8 +501,8 @@ class BatchTab(ttk.Frame):
         if self.scan_is_stale():
             messagebox.showinfo(
                 "Scan again first",
-                "The input or output folder changed since the last scan.\n"
-                "Press Scan so the list matches the folders you have chosen.",
+                "The folders or settings changed since the last scan.\n"
+                "Press Scan so the list matches the options you have chosen.",
             )
             return
         if not self._refresh_plan():
@@ -539,6 +559,20 @@ class BatchTab(ttk.Frame):
     def reencode_selected(self) -> None:
         # A redo writes the same output path the worker may be writing right now.
         if self.refuse_while_busy():
+            return
+        # A redo goes straight to the pipeline, and write_atomic creates missing
+        # parents — so before Start it would conjure the run folder into being
+        # without the confirmation that is supposed to precede it, and Start
+        # would then find the name taken and quietly move to the next one,
+        # stranding whatever the redo wrote.  Only ever re-do into a folder the
+        # user has already agreed to.
+        if self.run_plan is None or not self.run_plan.path.is_dir():
+            messagebox.showinfo(
+                "Run the batch first",
+                "Re-do writes into the run folder, and that is only created "
+                "when you press Start.\n\nRun the batch, then re-do individual "
+                "images to try different settings on them.",
+            )
             return
         selection = self.tree.selection()
         if not selection:

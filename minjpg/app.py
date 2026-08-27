@@ -157,6 +157,16 @@ class ThumbnailTab(FolderTab):
             )
         super().update_destination()
 
+    def scan_state(self) -> tuple:
+        # min_layout lives on the Settings tab, out of sight from here, and
+        # decides the whole shape of the run folder — so it counts too.
+        return super().scan_state() + (
+            self.recursive_var.get(),
+            self.force_var.get(),
+            self.jpeg_only_var.get(),
+            self.app.settings.min_layout,
+        )
+
     def perform_scan(self) -> scanner.ScanResult:
         folder = self.input_folder()
         if folder is None or not folder.is_dir():
@@ -270,6 +280,21 @@ class CompressTab(FolderTab):
         except ValueError as exc:
             raise scanner.ScanError(str(exc)) from exc
         return settings
+
+    def scan_state(self) -> tuple:
+        # The worker encodes with app.convert_settings, which only perform_scan
+        # refreshes — so every field here, not just the two that change the job
+        # list, has to force a re-scan before it can take effect.
+        return super().scan_state() + (
+            self.long_edge_var.get(),
+            self.quality_var.get(),
+            self.max_size_var.get(),
+            self.smoothing_var.get(),
+            self.strip_var.get(),
+            self.recursive_var.get(),
+            self.force_var.get(),
+            self.passthrough_var.get(),
+        )
 
     def perform_scan(self) -> scanner.ScanResult:
         settings = self.current_settings()

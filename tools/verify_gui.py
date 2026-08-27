@@ -252,6 +252,119 @@ def test_stale_scan(driver: Driver) -> None:
     check(not tab.busy(), "no worker was started")
 
 
+def test_stale_settings(driver: Driver) -> None:
+    section("Changing an option after Scan blocks Start")
+    import tkinter
+    from minjpg.config import LAYOUT_BESIDE, LAYOUT_SUBFOLDER
+
+    infos: list[str] = []
+    tkinter.messagebox.showinfo = lambda title, msg, **k: infos.append(title)
+
+    thumbnails, compress = driver.app.thumbnail_tab, driver.app.compress_tab
+    for tab in (thumbnails, compress):
+        tab.input_var.set(str(driver.input))
+        tab.output_var.set(str(driver.output))
+
+    # Each of these decides either which files are processed or how, and the
+    # worker reads them from the settings object the scan filled in — so a
+    # change after the scan has to force another one rather than be ignored.
+    cases = [
+        (thumbnails, "Include subfolders",
+         lambda: thumbnails.recursive_var.set(not thumbnails.recursive_var.get())),
+        (thumbnails, "JPEG sources only",
+         lambda: thumbnails.jpeg_only_var.set(not thumbnails.jpeg_only_var.get())),
+        (thumbnails, "Force re-encode",
+         lambda: thumbnails.force_var.set(not thumbnails.force_var.get())),
+        (thumbnails, "thumbnail layout (Settings tab)",
+         lambda: setattr(
+             driver.app.settings, "min_layout",
+             LAYOUT_BESIDE if driver.app.settings.min_layout == LAYOUT_SUBFOLDER
+             else LAYOUT_SUBFOLDER,
+         )),
+        (compress, "Quality", lambda: compress.quality_var.set("55")),
+        (compress, "Max long edge", lambda: compress.long_edge_var.set("2000")),
+        (compress, "Max size", lambda: compress.max_size_var.set("250")),
+        (compress, "Smoothing", lambda: compress.smoothing_var.set("10")),
+        (compress, "Remove all metadata",
+         lambda: compress.strip_var.set(not compress.strip_var.get())),
+        (compress, "Copy JPEGs that already fit",
+         lambda: compress.passthrough_var.set(not compress.passthrough_var.get())),
+        (compress, "Include subfolders",
+         lambda: compress.recursive_var.set(not compress.recursive_var.get())),
+        (compress, "Force re-convert",
+         lambda: compress.force_var.set(not compress.force_var.get())),
+    ]
+    for tab, label, change in cases:
+        tab.scan()
+        driver.pump()
+        check(not tab.scan_is_stale(), f"a fresh scan is not stale ({label})")
+        change()
+        check(tab.scan_is_stale(), f"changing '{label}' needs another scan")
+
+    # …and Start actually refuses, rather than running the list it already had.
+    thumbnails.scan()
+    driver.pump()
+    plan = thumbnails.run_plan
+    thumbnails.recursive_var.set(not thumbnails.recursive_var.get())
+    infos.clear()
+    thumbnails.start()
+    driver.pump(0.4)
+    check("Scan again first" in infos, f"Start refused (dialogs seen: {infos})")
+    check(not plan.path.exists(), "nothing was created for the stale scan")
+    check(not thumbnails.busy(), "no worker was started")
+
+
+def test_redo_needs_a_run_folder(driver: Driver) -> None:
+    section("Re-do before Start cannot conjure the run folder into being")
+    import tkinter
+
+    infos: list[str] = []
+    tkinter.messagebox.showinfo = lambda title, msg, **k: infos.append(title)
+
+    tab = driver.app.compress_tab
+    tab.input_var.set(str(driver.input))
+    tab.output_var.set(str(driver.output))
+    tab.scan()
+    driver.pump()
+    planned = tab.run_plan.path
+    check(not planned.exists(), "the planned folder does not exist before Start")
+
+    rows = tab.tree.get_children()
+    tab.tree.selection_set(rows[0])
+    tab.override_quality_var.set("50")
+    infos.clear()
+    tab.reencode_selected()
+    driver.pump()
+    tab.override_quality_var.set("")
+    check("Run the batch first" in infos, f"the re-do was refused (dialogs: {infos})")
+    check(not planned.exists(), f"nothing created {planned.name} behind the user's back")
+
+    # The name is still free, so Start uses it rather than stepping aside and
+    # stranding whatever the re-do had written.
+    plan = driver.run(tab, "after-refused-redo")
+    check(plan.path == planned,
+          f"Start used the folder it planned ({plan.path.name} vs {planned.name})")
+
+    # A re-do after the run is the supported path and must still work.  The run
+    # re-scanned, so the tree has been rebuilt and the old row ids are gone.
+    # It has to be an encoded row: a copied file has nothing to re-encode.
+    from minjpg.scanner import PROCESS
+
+    row = next(r for r in tab.tree.get_children() if tab.rows[r].action == PROCESS)
+    tab.tree.selection_set(row)
+    target = tab.rows[row].output
+    before = target.stat().st_size if target.is_file() else None
+    tab.override_quality_var.set("35")
+    infos.clear()
+    tab.reencode_selected()
+    driver.pump()
+    tab.override_quality_var.set("")
+    after = target.stat().st_size if target.is_file() else None
+    check(not infos and after is not None and after != before,
+          f"a re-do after Start still works ({before} -> {after} bytes, dialogs: {infos})")
+    return [plan]
+
+
 def test_empty_run_cleanup(driver: Driver) -> None:
     section("A run that writes nothing leaves nothing behind")
     import minjpg.batchtab as batchtab
@@ -321,6 +434,8 @@ def main() -> int:
         plans += test_compress_tab(driver)
         test_dialog_text(driver)
         test_stale_scan(driver)
+        test_stale_settings(driver)
+        plans += test_redo_needs_a_run_folder(driver)
         test_empty_run_cleanup(driver)
         test_nothing_stray(driver, plans)
     finally:
