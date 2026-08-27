@@ -1,0 +1,7 @@
+# Pinned so every build handed out is the same software, and so there is a
+# version to check against when an advisory lands.  Bump deliberately, then
+# re-run tools/verify_convert.py and tools/verify_against_examples.py.
+Pillow==12.3.0
+numpy==2.5.1
+pillow-heif==1.5.0   # HEIC/HEIF (and AVIF) input; bundles libheif 1.23.1 + libde265 1.1.1
+pyinstaller==6.21.0
