@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 from PIL import Image
 
 HEIF_AVAILABLE = False
@@ -41,6 +42,10 @@ _BASE_EXTENSIONS = {
 }
 _HEIF_EXTENSIONS = {".heic", ".heif", ".heics", ".heifs", ".hif", ".avif", ".avifs"}
 
+#: Formats whose extra frames are content — pages or animation — rather than
+#: layers (PSD), sizes (ICO) or a camera's embedded preview image (MPO).
+PAGED_FORMATS = frozenset({"TIFF", "GIF", "WEBP", "PNG"})
+
 
 def source_extensions(include_heif: bool = True) -> frozenset[str]:
     extensions = set(_BASE_EXTENSIONS)
@@ -66,3 +71,38 @@ def open_image(path: Path) -> Image.Image:
     opened = Image.open(path)
     opened.load()
     return opened
+
+
+def frame_count(image: Image.Image) -> int:
+    return max(1, int(getattr(image, "n_frames", 1) or 1))
+
+
+def describe_frames(image_format: str | None, frames: int) -> str:
+    if image_format == "TIFF":
+        return f"multi-page TIFF ({frames} pages)"
+    return f"animated {image_format or 'image'} ({frames} frames)"
+
+
+def to_8bit(image: Image.Image) -> Image.Image:
+    """Scale 16-bit and floating-point pixels into 0-255, as mode ``L``.
+
+    Pillow's ``convert()`` clips such values instead of scaling them, so a
+    16-bit greyscale scan converted straight to RGB came out solid white.
+    Returns ``image`` itself when it already has 8 bits per channel.
+    """
+    mode = image.mode
+    if mode == "F":
+        values = np.nan_to_num(np.asarray(image, dtype=np.float64))
+        scale = 255.0 if values.max(initial=0.0) <= 1.0 else 1.0
+        return Image.fromarray(np.clip(values * scale + 0.5, 0, 255).astype(np.uint8))
+    if mode.startswith("I;16"):
+        values = np.asarray(image).astype(np.uint32)  # numpy handles the byte order
+        full = 65535
+    elif mode == "I":
+        values = np.clip(np.asarray(image).astype(np.int64), 0, None)
+        top = int(values.max(initial=0))
+        # 8-bit numbers in a 32-bit container, 16-bit ones, or something wider.
+        full = 255 if top <= 255 else 65535 if top <= 65535 else top
+    else:
+        return image
+    return Image.fromarray(((values * 255 + full // 2) // full).astype(np.uint8))

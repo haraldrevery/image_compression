@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from .common import write_atomic
+
 #: What each job calls itself in the folder name.
 JOB_SUFFIX = {"min": "min", "compress": "compressed"}
 
@@ -161,3 +163,35 @@ def discard_if_empty(path: Path) -> bool:
     except OSError:
         return False  # not empty, not there, or not ours to remove
     return True
+
+
+def discard_empty_tree(run_root: Path) -> bool:
+    """Remove a run folder that holds nothing but empty folders.
+
+    Walks bottom-up and only ever calls ``rmdir``, which refuses a folder with
+    anything in it, so no file can be lost.  Catches the parents that writing a
+    file creates on the way, which a list of mirrored empty folders would miss.
+    Returns whether the run folder is gone.
+    """
+    for dirpath, _dirnames, _filenames in os.walk(run_root, topdown=False):
+        discard_if_empty(Path(dirpath))
+    return not taken(run_root)
+
+
+#: Sits at the top of a run folder from the moment it is created until every
+#: file has been written.  While it is there, the folder is not a complete copy
+#: of the input — the one thing to know before deleting originals.  A crash, a
+#: power cut or closing the app mid-run all leave it in place, which is the
+#: point.  The scanner reserves the name, so a mirrored file never collides.
+MARKER_NAME = "_minjpg_INCOMPLETE.txt"
+
+
+def write_marker(run_root: Path, text: str) -> None:
+    write_atomic(run_root / MARKER_NAME, text.encode("utf-8"))
+
+
+def remove_marker(run_root: Path) -> None:
+    try:
+        (run_root / MARKER_NAME).unlink()
+    except FileNotFoundError:
+        pass

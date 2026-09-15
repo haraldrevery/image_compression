@@ -58,7 +58,6 @@ class Settings:
     # Scanning
     recursive: bool = True
     jpeg_only: bool = False
-    force: bool = False
 
     # Where results go.  This is the folder the user picks; the run folder is
     # created *inside* it, so nothing that was already there is ever written to.
@@ -95,6 +94,9 @@ class Settings:
             raise ValueError("Hard cap cannot be below the size target.")
         if self.min_long_edge < 16:
             raise ValueError("Minimum long edge must be at least 16 px.")
+        if self.max_shrink_rounds < 0:
+            # A negative count skipped the search entirely: every image failed.
+            raise ValueError("Max shrink rounds cannot be negative (0 turns shrinking off).")
         if self.min_layout not in MIN_LAYOUTS:
             raise ValueError(
                 f"Thumbnail layout must be one of {', '.join(MIN_LAYOUTS)}."
@@ -122,7 +124,6 @@ class ConvertSettings:
     linear_light_resize: bool = True
 
     recursive: bool = True
-    force: bool = False
 
     input_folder: str = ""
     # As on the _min side: the folder the run folder is created inside.
@@ -135,12 +136,19 @@ class ConvertSettings:
             raise ValueError("Quality must be between 1 and 100.")
         if not 1 <= self.quality_floor <= 100:
             raise ValueError("Quality floor must be between 1 and 100.")
-        if self.quality_floor > self.quality:
-            raise ValueError("Quality floor cannot exceed the quality.")
         if not 0 <= self.smoothing <= 100:
             raise ValueError("Smoothing must be between 0 and 100.")
         if self.max_size and self.max_size < 1024:
             raise ValueError("Max size must be at least 1 KB (or 0 to disable).")
+
+    @property
+    def effective_floor(self) -> int:
+        """The lowest quality the cap search may use.
+
+        Never above the quality asked for.  The floor is not a field on the tab,
+        so refusing a quality below it used to leave no way to ask for one.
+        """
+        return min(self.quality_floor, self.quality)
 
 
 def config_path() -> Path:
@@ -178,7 +186,8 @@ def _build(cls, values: dict) -> tuple[object, str | None]:
 
     Unknown keys are dropped, which is also the migration path for configs
     written before this: the old ``output_folder``/``mirror_subfolders`` keys
-    simply disappear.  That is deliberate.  ``output_folder`` used to be able to
+    simply disappear, as does ``force``, which stopped meaning anything once
+    every run got a folder of its own.  That is deliberate.  ``output_folder`` used to be able to
     hold the *input* folder, meaning "write in place"; carrying it over as the
     new ``output_parent`` would silently aim a run's output folder at the user's
     own photos.  A blank value that makes the app ask is the safe answer.

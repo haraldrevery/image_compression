@@ -93,7 +93,6 @@ def main() -> int:
         return 2
 
     settings = Settings()
-    settings.force = True
     settings.recursive = False
     pairs = [
         (path, reference)

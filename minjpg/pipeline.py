@@ -40,8 +40,7 @@ class Result:
 
 def load_source(path: Path) -> Image.Image:
     """Open an image as upright sRGB, with any transparency flattened onto white."""
-    image, _exif, _converted = convert.load_source(path)
-    return image
+    return convert.load_source(path).image
 
 
 def _search_quality(

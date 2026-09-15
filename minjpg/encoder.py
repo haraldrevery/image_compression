@@ -159,8 +159,10 @@ def encode(image: Image.Image, quality: int, smoothing: int = 30) -> bytes:
     binary = cjpeg_path()
     # TemporaryDirectory cleans up whatever is inside it, however we leave: the
     # old hand-rolled unlink/rmdir leaked the whole directory - and a full-size
-    # PPM with it - if cjpeg left anything unexpected behind.
-    with tempfile.TemporaryDirectory(prefix="minjpg-") as tmpdir:
+    # PPM with it - if cjpeg left anything unexpected behind.  A cleanup that
+    # fails (Windows antivirus still holding the file) must not turn a
+    # successful encode into a failed one; the OS temp cleaner gets it later.
+    with tempfile.TemporaryDirectory(prefix="minjpg-", ignore_cleanup_errors=True) as tmpdir:
         ppm = Path(tmpdir) / "in.ppm"
         jpg = Path(tmpdir) / "out.jpg"
         image.save(ppm, format="PPM")

@@ -85,6 +85,17 @@ class Driver:
 
         # Never touch the real settings file while testing.
         config.config_path = lambda: tmp / "settings.json"
+
+        # No dialog may ever block a headless run.  Tests that care about one
+        # install their own stub; everything else is recorded here.
+        import tkinter.messagebox as mb
+
+        self.dialogs: list[tuple[str, str, str]] = []
+        for kind in ("showinfo", "showwarning", "showerror"):
+            setattr(mb, kind, lambda title="", message="", _kind=kind, **_: (
+                self.dialogs.append((_kind, str(title), str(message)))
+            ))
+        mb.askokcancel = lambda *a, **k: True
         real_base_name = runfolder.base_name
         runfolder.base_name = lambda folder, kind, when=None: real_base_name(
             folder, kind, when or self.WHEN
@@ -137,6 +148,7 @@ def test_folders_required(driver: Driver) -> None:
         check(not tab.ensure_ready(), f"{name}: refuses with both folders blank")
         tab.input_var.set(str(driver.input))
         check(not tab.ensure_ready(), f"{name}: refuses with only the input set")
+        driver.pump(0.5)  # the hint refreshes once typing pauses
         print(f"        hint: {tab.destination_var.get()}")
         tab.input_var.set("")
 
@@ -274,8 +286,6 @@ def test_stale_settings(driver: Driver) -> None:
          lambda: thumbnails.recursive_var.set(not thumbnails.recursive_var.get())),
         (thumbnails, "JPEG sources only",
          lambda: thumbnails.jpeg_only_var.set(not thumbnails.jpeg_only_var.get())),
-        (thumbnails, "Force re-encode",
-         lambda: thumbnails.force_var.set(not thumbnails.force_var.get())),
         (thumbnails, "thumbnail layout (Settings tab)",
          lambda: setattr(
              driver.app.settings, "min_layout",
@@ -292,8 +302,6 @@ def test_stale_settings(driver: Driver) -> None:
          lambda: compress.passthrough_var.set(not compress.passthrough_var.get())),
         (compress, "Include subfolders",
          lambda: compress.recursive_var.set(not compress.recursive_var.get())),
-        (compress, "Force re-convert",
-         lambda: compress.force_var.set(not compress.force_var.get())),
     ]
     for tab, label, change in cases:
         tab.scan()
@@ -408,6 +416,183 @@ def test_redo_needs_a_run_folder(driver: Driver) -> None:
     return [plan]
 
 
+def test_reporting_and_markers(driver: Driver) -> list:
+    section("Every row reports its own result; incomplete runs say so")
+    import errno
+
+    from minjpg import runfolder
+    from minjpg.config import LAYOUT_BESIDE
+    from minjpg.scanner import COPY, PROCESS
+
+    tab = driver.app.thumbnail_tab
+    tab.input_var.set(str(driver.input))
+    tab.output_var.set(str(driver.output))
+    driver.app.settings.min_layout = LAYOUT_BESIDE
+    tab.settings = driver.app.settings
+    real_run = tab.run_one
+    plans = []
+
+    def rows(action=None):
+        return [r for r in tab.tree.get_children()
+                if action is None or tab.rows[r].action == action]
+
+    def run_with(run_one, label):
+        tab.run_one = run_one
+        driver.dialogs.clear()
+        try:
+            plan = driver.run(tab, label)
+        finally:
+            tab.run_one = real_run
+        plans.append(plan)
+        return plan, plan.path / runfolder.MARKER_NAME
+
+    # 1. In the "beside" layout every image has two rows, its copy and its
+    #    thumbnail.  They share a source path, and used to share one row.
+    plan, marker = run_with(real_run, "beside-statuses")
+    stuck = [tab.tree.item(r, "text") for r in rows()
+             if tab.tree.set(r, "status") in ("queued", "working")]
+    check(not stuck, f"no row is left queued once the run is over (stuck: {stuck})")
+    check(all(tab.tree.set(r, "status") == "copied" for r in rows(COPY)),
+          "copy rows report the copy, not the thumbnail")
+    check(all(tab.tree.set(r, "status") in ("done", "shrunk", "at floor") for r in rows(PROCESS)),
+          "thumbnail rows report the thumbnail")
+    check(not marker.exists(), "a complete run removes its incomplete marker")
+
+    # 2. One thumbnail fails: the marker names it, the user is told, and a
+    #    successful re-do of that row makes the folder complete again.
+    victim = sorted(driver.input.glob("*.jpg"))[0]
+
+    def flaky(job):
+        if job.source == victim:
+            raise RuntimeError("simulated encoder crash")
+        return real_run(job)
+
+    plan, marker = run_with(flaky, "one-failure")
+    check(marker.is_file() and victim.name in marker.read_text(encoding="utf-8"),
+          "the marker names the file that failed")
+    check(any(kind == "showerror" for kind, _t, _m in driver.dialogs),
+          "the user is told the run had problems")
+    row = next(r for r in rows(PROCESS) if tab.rows[r].source == victim)
+    check(tab.tree.set(row, "status") == "failed", "the failed row says so")
+    tab.tree.selection_set(row)
+    tab.override_long_var.set("")
+    tab.override_quality_var.set("")
+    tab.reencode_selected()
+    while tab.busy():
+        driver.pump(0.05)
+    driver.pump(0.3)
+    check(tab.tree.set(row, "status") != "failed", "the re-done row reports success")
+    check(not marker.exists(), "fixing the only failure removes the marker")
+
+    # 3. A full disk stops the batch instead of failing every remaining file.
+    calls = []
+
+    def disk_full(job):
+        calls.append(job)
+        if len(calls) >= 2:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real_run(job)
+
+    plan, marker = run_with(disk_full, "disk-full")
+    check(len(calls) == 2, f"the batch stopped at the first full-disk error ({len(calls)} tries)")
+    check(marker.is_file() and "stopped" in marker.read_text(encoding="utf-8"),
+          "the marker says the run stopped")
+    check(tab.progress_var.get() == "stopped",
+          f"the progress line says stopped ({tab.progress_var.get()!r})")
+    check(any(kind == "showerror" and "stopped early" in msg for kind, _t, msg in driver.dialogs),
+          "the user is told the disk is full")
+    check(str(tab.start_button["state"]) == "normal", "Start is usable again afterwards")
+
+    # 4. Cancel leaves the marker, because the folder really is incomplete.
+    def cancel_now(job):
+        tab.worker.cancelled.set()
+        return real_run(job)
+
+    plan, marker = run_with(cancel_now, "cancelled")
+    check(marker.is_file() and "cancelled" in marker.read_text(encoding="utf-8"),
+          "a cancelled run stays marked incomplete")
+    check(not driver.dialogs, f"cancelling is not reported as a problem ({driver.dialogs})")
+
+    # 5. Compress tab: an image that cannot be decoded is carried across
+    #    unchanged instead of silently missing from the "full mirror".
+    ctab = driver.app.compress_tab
+    ctab.input_var.set(str(driver.input))
+    ctab.output_var.set(str(driver.output))
+    broken = driver.input / "broken.png"
+    payload = b"\x89PNG\r\n\x1a\n" + b"junk" * 64
+    broken.write_bytes(payload)
+    driver.dialogs.clear()
+    try:
+        plan = driver.run(ctab, "kept-original")
+    finally:
+        broken.unlink()
+    plans.append(plan)
+    kept = plan.path / "broken.png"
+    check(kept.is_file() and kept.read_bytes() == payload,
+          "the undecodable image was copied across unchanged")
+    row = next(r for r in ctab.tree.get_children() if ctab.rows[r].source.name == "broken.png")
+    check(ctab.tree.set(row, "status") == "kept original",
+          f"its row says so ({ctab.tree.set(row, 'status')!r})")
+    check(not (plan.path / runfolder.MARKER_NAME).exists(),
+          "nothing is missing, so there is no incomplete marker")
+    check(any(kind == "showwarning" for kind, _t, _m in driver.dialogs),
+          "the user is told an original was kept")
+    return plans
+
+
+def test_pump_survives(driver: Driver) -> None:
+    section("One bad event cannot freeze a tab")
+    import types
+
+    tab = driver.app.compress_tab
+    fake_root = driver.tmp / "fake-run"
+    fake_root.mkdir()
+    fake = types.SimpleNamespace(
+        stop_reason=None, processed=0, total=0, done=0, kept=0, failed_rows={},
+        run_root=fake_root, source_root=driver.input, is_alive=lambda: False,
+    )
+    tab.worker = fake
+    tab.start_button.configure(state="disabled")
+    tab.events.put(("done",))  # malformed: raises inside the handler
+    tab.events.put(("finished", fake))
+    driver.pump(0.5)
+    check(tab.events.empty(), "the events after the bad one were still handled")
+    check(str(tab.start_button["state"]) == "normal", "Start came back once the run ended")
+    tab.worker = None
+
+
+def test_preview_and_hint(driver: Driver) -> None:
+    section("The folder hint and the preview stay responsive and truthful")
+    from PIL import Image
+
+    tab = driver.app.compress_tab
+    tab.input_var.set(str(driver.input))
+    tab.output_var.set(str(driver.output))
+    driver.pump(0.5)
+    hint = tab.destination_var.get()
+    check(hint.startswith("Will create:"), f"the hint names the folder once typing pauses ({hint!r})")
+
+    # A photo stored sideways with an EXIF rotation previews upright, as its
+    # result is written - not on its side next to an upright result.
+    source = sorted(driver.input.glob("*.jpg"))[0]
+    rotated = driver.tmp / "rotated-preview.jpg"
+    with Image.open(source) as image:
+        width, height = image.size
+        exif = Image.Exif()
+        exif[0x0112] = 6  # rotate 90 degrees clockwise to display
+        image.save(rotated, exif=exif, quality=85)
+    started = time.perf_counter()
+    tab._show(tab.before_label, tab.before_info, rotated, (400, 400))
+    elapsed = time.perf_counter() - started
+    photo = tab.before_label.image
+    info = str(tab.before_info.cget("text"))
+    print(f"        {width}x{height} stored -> preview {photo.width()}x{photo.height()}, "
+          f"{info!r}, {elapsed * 1000:.0f} ms")
+    check((photo.width() > photo.height()) == (height > width),
+          "an EXIF-rotated photo previews upright")
+    check(info.startswith(f"{height}x{width}"), f"the preview reports the upright size ({info!r})")
+
+
 def test_empty_run_cleanup(driver: Driver) -> None:
     section("A run that writes nothing leaves nothing behind")
     import minjpg.batchtab as batchtab
@@ -479,6 +664,9 @@ def main() -> int:
         test_stale_scan(driver)
         test_stale_settings(driver)
         plans += test_redo_needs_a_run_folder(driver)
+        plans += test_reporting_and_markers(driver)
+        test_pump_survives(driver)
+        test_preview_and_hint(driver)
         test_empty_run_cleanup(driver)
         test_nothing_stray(driver, plans)
     finally:

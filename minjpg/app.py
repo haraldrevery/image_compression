@@ -53,12 +53,29 @@ class FolderTab(BatchTab):
                 command=lambda v=var, t=title: self._browse_folder(v, t),
             ).pack(side="left")
 
+    #: A pending refresh of the destination hint, see :meth:`_destination_soon`.
+    _destination_job: str | None = None
+
     def build_destination_label(self) -> None:
         ttk.Label(
             self, textvariable=self.destination_var, foreground="#1a5c1a",
         ).pack(fill="x", pady=(0, 6))
         for var in (self.input_var, self.output_var):
-            var.trace_add("write", lambda *_: self.update_destination())
+            var.trace_add("write", lambda *_: self._destination_soon())
+        self.update_destination()
+
+    def _destination_soon(self) -> None:
+        """Refresh the hint once typing pauses, not on every keystroke.
+
+        Each refresh touches the disk — does the folder exist, is the name
+        taken — and on a slow network path that cost seconds per keystroke.
+        """
+        if self._destination_job is not None:
+            self.after_cancel(self._destination_job)
+        self._destination_job = self.after(300, self._destination_now)
+
+    def _destination_now(self) -> None:
+        self._destination_job = None
         self.update_destination()
 
     def _browse_folder(self, var: StringVar, title: str) -> None:
@@ -120,7 +137,6 @@ class ThumbnailTab(FolderTab):
         self.input_var = StringVar(value=self.settings.last_folder)
         self.output_var = StringVar(value=self.settings.output_parent)
         self.recursive_var = BooleanVar(value=self.settings.recursive)
-        self.force_var = BooleanVar(value=self.settings.force)
         self.jpeg_only_var = BooleanVar(value=self.settings.jpeg_only)
         self.destination_var = StringVar()
         self.layout_var = StringVar(value=self.settings.min_layout)
@@ -132,7 +148,6 @@ class ThumbnailTab(FolderTab):
         options = ttk.Frame(self)
         options.pack(fill="x", pady=(6, 2))
         self.check_field(options, "Include subfolders", self.recursive_var)
-        self.check_field(options, "Force re-encode", self.force_var)
         self.check_field(options, "JPEG sources only", self.jpeg_only_var)
         ttk.Button(options, text="Scan", command=self.scan).pack(side="left")
         ttk.Label(options, textvariable=self.status_var).pack(side="right")
@@ -147,8 +162,8 @@ class ThumbnailTab(FolderTab):
         self.layout_var.set(self.app.settings.min_layout)
         if self.layout_var.get() == LAYOUT_BESIDE:
             self.layout_label.configure(
-                text=f"Layout: the whole input folder is copied across, with each "
-                     f"*_min.jpg next to its original.  (Settings tab)"
+                text="Layout: the whole input folder is copied across, with each "
+                     "*_min.jpg next to its original.  (Settings tab)"
             )
         else:
             self.layout_label.configure(
@@ -162,7 +177,6 @@ class ThumbnailTab(FolderTab):
         # decides the whole shape of the run folder — so it counts too.
         return super().scan_state() + (
             self.recursive_var.get(),
-            self.force_var.get(),
             self.jpeg_only_var.get(),
             self.app.settings.min_layout,
         )
@@ -173,7 +187,6 @@ class ThumbnailTab(FolderTab):
             raise scanner.ScanError("Pick an existing input folder first.")
         self.settings = self.app.settings
         self.settings.recursive = self.recursive_var.get()
-        self.settings.force = self.force_var.get()
         self.settings.jpeg_only = self.jpeg_only_var.get()
         self.settings.output_parent = self.output_var.get().strip()
         self.settings.last_folder = str(folder)
@@ -228,7 +241,6 @@ class CompressTab(FolderTab):
         self.smoothing_var = StringVar(value=str(settings.smoothing))
         self.strip_var = BooleanVar(value=settings.strip_metadata)
         self.recursive_var = BooleanVar(value=settings.recursive)
-        self.force_var = BooleanVar(value=settings.force)
         self.passthrough_var = BooleanVar(value=settings.passthrough)
         super().__init__(master, app)
 
@@ -246,7 +258,6 @@ class CompressTab(FolderTab):
         second = ttk.Frame(self)
         second.pack(fill="x", pady=(2, 4))
         self.check_field(second, "Include subfolders", self.recursive_var)
-        self.check_field(second, "Force re-convert", self.force_var)
         self.check_field(second, "Copy JPEGs that already fit", self.passthrough_var)
         self.check_field(second, "Remove all metadata", self.strip_var)
         ttk.Label(second, textvariable=self.status_var).pack(side="right")
@@ -275,7 +286,6 @@ class CompressTab(FolderTab):
             ) from exc
         settings.strip_metadata = self.strip_var.get()
         settings.recursive = self.recursive_var.get()
-        settings.force = self.force_var.get()
         settings.passthrough = self.passthrough_var.get()
         settings.input_folder = self.input_var.get().strip()
         settings.output_parent = self.output_var.get().strip()
@@ -296,7 +306,6 @@ class CompressTab(FolderTab):
             self.smoothing_var.get(),
             self.strip_var.get(),
             self.recursive_var.get(),
-            self.force_var.get(),
             self.passthrough_var.get(),
         )
 

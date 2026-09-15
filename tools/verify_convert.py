@@ -9,7 +9,8 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import io
+import errno
+import os
 import shutil
 import sys
 import tempfile
@@ -56,7 +57,7 @@ def section(title: str) -> None:
 
 def test_real_originals(data: Path, sample: int, out: Path) -> None:
     section(f"Real originals from {data.name}")
-    settings = ConvertSettings(force=True, max_long_edge=1600, quality=65, max_size=0)
+    settings = ConvertSettings(max_long_edge=1600, quality=65, max_size=0)
     sources = [p for p in sorted(data.glob("*.jpg")) if not scanner.is_min_file(p)][:sample]
     print(f"{'file':40}{'source':>14}{'output':>14}{'KB':>8}{'q':>4}  status")
     for source in sources:
@@ -84,7 +85,7 @@ def test_real_originals(data: Path, sample: int, out: Path) -> None:
 
 def test_formats(tmp: Path, out: Path) -> None:
     section("Format coverage")
-    settings = ConvertSettings(force=True, max_long_edge=800, quality=70, max_size=0)
+    settings = ConvertSettings(max_long_edge=800, quality=70, max_size=0)
     rng = np.random.default_rng(3)
     base = Image.fromarray(rng.integers(0, 256, (900, 1200, 3), dtype=np.uint8))
 
@@ -112,7 +113,14 @@ def test_formats(tmp: Path, out: Path) -> None:
 
     multi_path = tmp / "multi.tif"
     base.save(multi_path, save_all=True, append_images=[base.transpose(Image.ROTATE_180)])
-    made.append(("multipage tiff", multi_path))
+
+    # 16-bit greyscale, which convert() would clip to white rather than scale.
+    grey16 = np.full((600, 900), 20000, dtype=np.uint16)  # ~30% grey
+    grey16[:, 450:] = 50000  # ~76% grey
+    for ext in ("png", "tif"):
+        path = tmp / f"grey16.{ext}"
+        Image.fromarray(grey16).save(path)
+        made.append((f"16-bit {ext}", path))
 
     if formats.HEIF_AVAILABLE:
         heic_path = tmp / "sample.heic"
@@ -140,17 +148,54 @@ def test_formats(tmp: Path, out: Path) -> None:
         corner = written.convert("RGB").getpixel((written.width - 4, 4))
     check(min(corner) > 200, f"alpha flattened onto {corner}, expected near-white")
 
+    pa = convert.flatten_alpha(Image.new("PA", (4, 4)))  # palette + alpha, fully clear
+    check(pa.mode == "RGB" and pa.getpixel((0, 0)) == (255, 255, 255),
+          f"PA transparency flattened onto {pa.getpixel((0, 0))}, expected white")
+
+    for ext in ("png", "tif"):
+        r = convert.convert(tmp / f"grey16.{ext}", out / f"grey16-{ext}.jpg", settings)
+        with Image.open(r.output) as written:
+            grey = np.asarray(written.convert("L"), dtype=float)
+        left, right = grey[:, :300].mean(), grey[:, -300:].mean()
+        print(f"  16-bit {ext}: {left:.0f}/{right:.0f} (expected ~78/~195), notes={r.notes!r}")
+        check(abs(left - 78) <= 4 and abs(right - 195) <= 4,
+              f"16-bit {ext} came out {left:.0f}/{right:.0f}, expected about 78/195")
+        check("8 bits" in r.notes, "reducing a 16-bit source should be noted")
+
+    # Pages and animation: a JPEG holds one picture, so these are handed back
+    # to be kept whole (the batch copies the original) rather than cut down.
+    anim = tmp / "anim.gif"
+    base.save(anim, save_all=True, append_images=[base.transpose(Image.ROTATE_180)])
+    for label, path in (("multipage tiff", multi_path), ("animated gif", anim)):
+        try:
+            convert.convert(path, out / f"multi-{path.stem}.jpg", settings)
+            check(False, f"{label}: converting should hand it back to be kept whole")
+        except convert.KeepOriginal as exc:
+            print(f"  {label:16} -> kept whole: {exc}")
+        check(not (out / f"multi-{path.stem}.jpg").exists(), f"{label}: a first-frame JPEG was written")
+    thumb = pipeline.compress(multi_path, out / "multi_min.jpg", Settings())
+    check(thumb.output.is_file(), "a multi-page TIFF should still get a thumbnail of page one")
+
 
 WIDE_GAMUT_CANDIDATES = [
     "/usr/share/color/icc/colord/AdobeRGB1998.icc",
     "/usr/share/color/icc/colord/ProPhotoRGB.icc",
     "/usr/share/color/icc/ghostscript/a98.icc",
 ]
+CMYK_CANDIDATES = [
+    "/usr/share/color/icc/colord/FOGRA39L_coated.icc",
+    "/usr/share/color/icc/colord/SWOP_TR005_coated_5.icc",
+    "/usr/share/color/icc/ghostscript/default_cmyk.icc",
+]
+GREY_CANDIDATES = [
+    "/usr/share/color/icc/ghostscript/default_gray.icc",
+    "/usr/share/color/icc/ghostscript/ps_gray.icc",
+]
 
 
 def test_wide_gamut(tmp: Path, out: Path) -> None:
     section("Wide-gamut colour conversion")
-    settings = ConvertSettings(force=True, max_long_edge=600, quality=90, max_size=0)
+    settings = ConvertSettings(max_long_edge=600, quality=90, max_size=0)
     colour = (0, 200, 90)  # saturated green - well outside sRGB in Adobe RGB terms
 
     profile_path = next((p for p in WIDE_GAMUT_CANDIDATES if Path(p).is_file()), None)
@@ -197,6 +242,32 @@ def test_wide_gamut(tmp: Path, out: Path) -> None:
     check(all(abs(a - b) < 8 for a, b in zip(got, colour)),
           f"sRGB-tagged colour drifted to {got}")
 
+    # CMYK and greyscale profiles describe CMYK and greyscale numbers.  They
+    # used to be applied after a naive RGB conversion, which always failed.
+    for label, candidates, mode, value in (
+        ("CMYK", CMYK_CANDIDATES, "CMYK", (20, 180, 40, 10)),
+        ("grey", GREY_CANDIDATES, "L", 90),
+    ):
+        found = next((p for p in candidates if Path(p).is_file()), None)
+        if not found:
+            print(f"  (no {label} ICC profile on this system, skipping)")
+            continue
+        tagged = tmp / f"tagged-{label}.jpg"
+        Image.new(mode, (600, 400), value).save(
+            tagged, icc_profile=Path(found).read_bytes(), quality=98
+        )
+        expected = ImageCms.profileToProfile(
+            Image.new(mode, (8, 8), value), ImageCms.getOpenProfile(found),
+            ImageCms.createProfile("sRGB"), outputMode="RGB",
+        ).getpixel((4, 4))
+        r = convert.convert(tagged, out / f"tagged-{label}.jpg", settings)
+        with Image.open(r.output) as written:
+            got = written.convert("RGB").getpixel((300, 200))
+        print(f"  {label} {value} via {Path(found).name}: expected {expected}, got {got}")
+        check(r.converted_colour, f"a {label} profile should be applied, not ignored")
+        check(all(abs(a - b) <= 6 for a, b in zip(got, expected)),
+              f"{label} conversion gave {got}, expected about {expected}")
+
     # An intentionally corrupt profile must not fail the file
     broken = tmp / "broken.jpg"
     Image.new("RGB", (600, 400), colour).save(broken, icc_profile=b"not-a-profile")
@@ -233,7 +304,7 @@ def test_metadata(tmp: Path, out: Path) -> None:
         src_orientation = opened.getexif().get(0x0112)
     print(f"  source {src_size}, orientation {src_orientation}, GPS present")
 
-    keep = ConvertSettings(force=True, max_long_edge=400, quality=70, max_size=0,
+    keep = ConvertSettings(max_long_edge=400, quality=70, max_size=0,
                            strip_metadata=False, passthrough=False)
     result = convert.convert(source, out / "meta-keep.jpg", keep)
     with Image.open(result.output) as written:
@@ -259,7 +330,17 @@ def test_metadata(tmp: Path, out: Path) -> None:
     check(out_size[0] < out_size[1],
           f"orientation 6 was not applied: output {out_size} is not portrait")
 
-    strip = ConvertSettings(force=True, max_long_edge=400, quality=70, max_size=0,
+    # EXIF too big for a JPEG's APP1 segment cannot be kept - and says so.
+    bulky = Image.Exif()
+    bulky[0x010E] = "x" * 70_000  # ImageDescription
+    bulky_path = tmp / "bulky-exif.png"
+    image.save(bulky_path, exif=bulky)
+    r = convert.convert(bulky_path, out / "bulky.jpg", keep)
+    print(f"  oversized EXIF: kept={r.metadata_kept} notes={r.notes!r}")
+    check(not r.metadata_kept and "EXIF could not be kept" in r.notes,
+          "dropping EXIF the user asked to keep must be reported")
+
+    strip = ConvertSettings(max_long_edge=400, quality=70, max_size=0,
                             strip_metadata=True)
     stripped = convert.convert(source, out / "meta-strip.jpg", strip)
     with Image.open(stripped.output) as written:
@@ -280,7 +361,7 @@ def test_cap_and_passthrough(tmp: Path, out: Path) -> None:
     noisy = tmp / "noisy.png"
     Image.fromarray(rng.integers(0, 256, (2000, 3000, 3), dtype=np.uint8)).save(noisy)
 
-    fits = ConvertSettings(force=True, max_long_edge=1600, quality=90, max_size=300_000)
+    fits = ConvertSettings(max_long_edge=1600, quality=90, max_size=300_000)
     r = convert.convert(noisy, out / "cap-fits.jpg", fits)
     print(f"  cap 300 KB: {r.output_size} {r.kilobytes:.1f} KB q{r.quality} "
           f"over_cap={r.over_cap}")
@@ -288,7 +369,7 @@ def test_cap_and_passthrough(tmp: Path, out: Path) -> None:
           f"searched result {r.byte_size} should be under the 300 KB cap")
     check(r.quality < 90, "quality should have been searched down to meet the cap")
 
-    tight = ConvertSettings(force=True, max_long_edge=1600, quality=90, max_size=40_000,
+    tight = ConvertSettings(max_long_edge=1600, quality=90, max_size=40_000,
                             quality_floor=40)
     r = convert.convert(noisy, out / "cap-over.jpg", tight)
     print(f"  cap  40 KB: {r.output_size} {r.kilobytes:.1f} KB q{r.quality} "
@@ -313,7 +394,7 @@ def test_cap_and_passthrough(tmp: Path, out: Path) -> None:
     small = Image.fromarray(rng.integers(0, 256, (400, 600, 3), dtype=np.uint8))
     already = tmp / "already.jpg"
     small.save(already, quality=80)
-    settings = ConvertSettings(force=True, max_long_edge=1600, quality=65,
+    settings = ConvertSettings(max_long_edge=1600, quality=65,
                                max_size=614_400)
     r = convert.convert(already, out / "already.jpg", settings)
     identical = r.output.read_bytes() == already.read_bytes()
@@ -322,12 +403,36 @@ def test_cap_and_passthrough(tmp: Path, out: Path) -> None:
     check(identical, "a copied file must be byte-identical to the source")
 
     r = convert.convert(already, out / "already-strip.jpg",
-                        ConvertSettings(force=True, max_long_edge=1600, quality=65,
+                        ConvertSettings(max_long_edge=1600, quality=65,
                                         max_size=614_400, strip_metadata=True))
     check(not r.copied, "passthrough must be off when metadata is being stripped")
     r = convert.convert(already, out / "already-override.jpg", settings, quality=50)
     check(not r.copied, "an explicit quality override must force a re-encode")
     print("  passthrough correctly disabled for strip_metadata and overrides")
+
+    # Passthrough trusts the content, not the name: a PNG called .jpg and a
+    # CMYK JPEG are re-encoded rather than copied as they are.
+    misnamed = tmp / "misnamed.jpg"
+    small.save(misnamed, format="PNG")
+    cmyk = tmp / "cmyk-small.jpg"
+    small.convert("CMYK").save(cmyk, quality=80)
+    for path in (misnamed, cmyk):
+        r = convert.convert(path, out / f"pt-{path.name}", settings)
+        with Image.open(r.output) as written:
+            web_ready = written.format == "JPEG" and written.mode == "RGB"
+        check(not r.copied and web_ready,
+              f"{path.name}: copied={r.copied}; the output must be an RGB JPEG")
+    print("  passthrough refused for a PNG named .jpg and for a CMYK JPEG")
+
+    # Quality below the (hidden) floor: the floor gives way instead of the
+    # tab refusing a quality nobody can see the reason for.
+    low = ConvertSettings(max_long_edge=1600, quality=30, max_size=40_000,
+                          quality_floor=40)
+    low.validate()
+    r = convert.convert(noisy, out / "low-quality.jpg", low)
+    print(f"  quality 30 under a floor of 40: q{r.quality} notes={r.notes!r}")
+    check(r.quality == 30, f"asking for quality 30 used q{r.quality}")
+    check(not r.over_cap or "floor 30" in r.notes, f"the note names the floor used: {r.notes!r}")
 
     unreadable = tmp / "broken.png"
     unreadable.write_bytes(b"not an image at all")
@@ -448,6 +553,18 @@ def test_run_folder(tmp: Path) -> None:
     empty = runfolder.create(runfolder.plan(parent, source, "compress", when))
     check(runfolder.discard_if_empty(empty.path), "an empty run folder should be removed")
 
+    # 6b. a run folder holding only empty folders goes entirely; one with a
+    #     file anywhere inside it stays, file and all
+    hollow = runfolder.create(runfolder.plan(parent, source, "compress", when))
+    (hollow.path / "a" / "b").mkdir(parents=True)
+    check(runfolder.discard_empty_tree(hollow.path), "a run folder of empty folders should go")
+    solid = runfolder.create(runfolder.plan(parent, source, "compress", when))
+    (solid.path / "a" / "b").mkdir(parents=True)
+    (solid.path / "a" / "b" / "f.txt").write_text("x")
+    check(not runfolder.discard_empty_tree(solid.path)
+          and (solid.path / "a" / "b" / "f.txt").read_text() == "x",
+          "discard_empty_tree removed a folder with a file in it")
+
     # 7. names stay legal on Windows
     awkward = tmp / "a:b*c?"
     awkward.mkdir()
@@ -517,6 +634,31 @@ def test_scanner(tmp: Path) -> None:
     check([d.name for d in result.empty_dirs] == ["empty"],
           f"the empty subfolder should be mirrored, got {result.empty_dirs}")
 
+    # Where each original goes if it cannot be converted - reserved at scan
+    # time, so the stand-in copy can never land on another job's output.
+    by_source = {str(j.source.relative_to(root)): j for j in result.jobs}
+    other = by_source["other.jpg"]
+    check(other.fallback == other.output, "a JPEG falls back onto its own output name")
+    check(by_source["photo.png"].fallback == run / "photo.png",
+          f"photo.png falls back to its own name, got {by_source['photo.png'].fallback}")
+    check(all(j.fallback is None for j in result.jobs if j.action == scanner.COPY),
+          "copies need no fallback")
+    taken = [j.output for j in result.jobs] + [
+        j.fallback for j in result.jobs if j.fallback and j.fallback != j.output
+    ]
+    check(len({str(p).casefold() for p in taken}) == len(taken),
+          "an output and a fallback were given the same name")
+
+    # The incomplete-run marker's name is reserved in every mirror.
+    marked = tmp / "scan-marker"
+    marked.mkdir()
+    (marked / runfolder.MARKER_NAME).write_text("the user's own file")
+    marked_result = scanner.scan_compress(marked, tmp / "scan-out" / "marked", ConvertSettings())
+    names = [j.output.name for j in marked_result.jobs]
+    print(f"  a file named like the marker -> {names}")
+    check(runfolder.MARKER_NAME not in names and len(names) == 1,
+          "a mirrored file was allowed to take the marker's name")
+
     # This app's own finished thumbnails are not source material for it either:
     # re-encoding a 70 KB _min.jpg at quality 65 only costs a second generation.
     # They ride along as copies, so the mirror is still complete.
@@ -547,6 +689,62 @@ def test_scanner(tmp: Path) -> None:
           "a non-recursive scan must not mirror subfolders it ignored")
     check(all("/" not in str(j.output.relative_to(run)) for j in shallow.jobs),
           "a non-recursive scan should stay at the top level")
+
+    # Folders the walk cannot enter are reported, and are not mirrored as
+    # empty folders that would pass for complete ones.
+    odd = tmp / "scan-odd"
+    (odd / "real").mkdir(parents=True)
+    (odd / "real" / "keep.txt").write_text("x")
+    elsewhere = tmp / "scan-elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "outside.txt").write_text("x")
+    (odd / "linked").symlink_to(elsewhere, target_is_directory=True)
+    locked = odd / "locked"
+    locked.mkdir()
+    (locked / "hidden.txt").write_text("x")
+    can_lock = os.name != "nt" and os.geteuid() != 0
+    if can_lock:
+        locked.chmod(0o000)
+    try:
+        odd_run = tmp / "scan-out" / "odd"
+        odd_result = scanner.scan_compress(odd, odd_run, ConvertSettings())
+    finally:
+        locked.chmod(0o755)
+    outputs = sorted(j.output.name for j in odd_result.jobs)
+    mirrored = sorted(str(p.relative_to(odd_run)) for p in odd_result.empty_dirs)
+    print(f"  linked/locked folders: jobs={outputs} empty_dirs={mirrored}")
+    print(f"    warnings={odd_result.warnings}")
+    check("keep.txt" in outputs and "outside.txt" not in outputs, "a linked folder was followed")
+    check("linked" not in mirrored, "a linked folder was mirrored as an empty one")
+    check(any("linked folder linked" in w for w in odd_result.warnings),
+          "skipping a linked folder must be reported")
+    if can_lock:
+        check("hidden.txt" not in outputs and "locked" not in mirrored,
+              "an unreadable folder was mirrored as an empty one")
+        check(any("could not read the folder locked" in w for w in odd_result.warnings),
+              "an unreadable folder must be reported")
+
+    # An output that is somehow already there is skipped, never overwritten.
+    pre = tmp / "scan-out" / "pre-existing"
+    pre.mkdir(parents=True)
+    (pre / "notes.txt").write_text("already here")
+    pre_result = scanner.scan_compress(root, pre, ConvertSettings())
+    check(all(j.output != pre / "notes.txt" for j in pre_result.jobs)
+          and (pre / "notes.txt").read_text() == "already here",
+          "an existing file in the run folder must be skipped, not overwritten")
+    check(any("already exists" in w for w in pre_result.warnings), "that skip must be reported")
+
+    # Renamed thumbnails are still thumbnails.
+    for name, expected in (("a_min.jpg", True), ("a_MIN-2.jpg", True), ("a_min-12.png", True),
+                           ("admin.jpg", False), ("a_minimal.jpg", False), ("a-2.jpg", False)):
+        check(scanner.is_min_file(Path(name)) == expected,
+              f"is_min_file({name}) should be {expected}")
+
+    try:
+        Settings(max_shrink_rounds=-1).validate()
+        check(False, "a negative shrink-round count must be refused")
+    except ValueError:
+        pass
 
 
 # --------------------------------------------------- thumbnail layouts + safety
@@ -622,8 +820,8 @@ def test_min_layouts(tmp: Path) -> None:
           "a.jpg was not copied intact")
 
     # ---- a fresh run folder means nothing is ever an overwrite
-    check(result.overwrites == 0 and result2.overwrites == 0 and both_result.overwrites == 0,
-          "a run into a fresh folder reported overwrites - the guarantee is broken")
+    check(not (result.skipped or result2.skipped or both_result.skipped),
+          "a scan into a fresh folder found outputs already there - the guarantee is broken")
 
 
 # ------------------------------------------------------ pre-flight and guards
@@ -634,28 +832,20 @@ def test_preflight(tmp: Path) -> None:
     root = tmp / "pre-in"
     build_tree(root, 23)
 
-    # Only temp files this app would itself have written may be deleted.  ".part"
-    # is also what Firefox and wget name in-progress downloads, and the output
-    # folder is wherever the user pointed us, so a blanket sweep destroys data.
+    # Scanning never deletes anything.  ".part" is also what Firefox and wget
+    # name in-progress downloads, and the output folder is wherever the user
+    # pointed us.  Our own temp files have random names and only ever live in a
+    # run folder made for that run, so there is nothing of ours to sweep up.
     stale_parent = tmp / "stale-out"
-    run = stale_parent / "run"
-    (run / "sub").mkdir(parents=True)
-    ours = run / f"{MIN_SUBDIR}"
-    ours.mkdir()
-    ours_part = ours / f"other_min.jpg{PART_SUFFIX}"
-    foreign = run / f"browser-download.zip{PART_SUFFIX}"
-    nested = run / "sub" / f"deep.iso{PART_SUFFIX}"
-    for path in (ours_part, foreign, nested):
+    stale_parent.mkdir()
+    foreign = stale_parent / f"browser-download.zip{PART_SUFFIX}"
+    lookalike = stale_parent / f"other_min.jpg{PART_SUFFIX}"
+    for path in (foreign, lookalike):
         path.write_bytes(b"partial")
-
-    cleaned = scanner.scan_min(root, run, Settings())
-    print(f"  stale .part: warnings={cleaned.warnings}")
-    check(not ours_part.exists(), "our own leftover .part should have been removed")
-    check(any("leftover temp file" in w for w in cleaned.warnings),
-          "removing a leftover .part should be reported")
-    check(foreign.exists() and foreign.read_bytes() == b"partial",
-          "a .part file we did not write must be left alone - it may be someone's download")
-    check(nested.exists(), "a nested .part file we did not write must be left alone")
+    scanner.scan_min(root, stale_parent / "run", Settings())
+    print("  scanning leaves .part files in the output folder alone")
+    check(all(p.is_file() and p.read_bytes() == b"partial" for p in (foreign, lookalike)),
+          "scanning touched a .part file it did not write - it may be someone's download")
 
     locked = tmp / "locked-out"
     locked.mkdir()
@@ -675,7 +865,6 @@ def test_preflight(tmp: Path) -> None:
         output_root=root,  # deliberately illegal; check_folders would refuse it
         extensions=frozenset({".jpg"}),
         output_name=lambda p: p.name,
-        force=True,
     ))
     print(f"  self-overwrite guard: {len(guarded.jobs)} jobs, {len(guarded.warnings)} warning(s)")
     check(len(guarded.jobs) == 0, "jobs that would overwrite their own source must be refused")
@@ -731,6 +920,73 @@ def test_atomic_writes(tmp: Path) -> None:
           "a failed copy damaged the file that was already there")
     check(not list((tmp / "atomic").glob(f"*{PART_SUFFIX}")), "a failed copy left a .part behind")
     print("  write_atomic and copy_atomic keep existing files intact on failure")
+
+    # A real file that happens to carry an output's old temp name is never used
+    # as scratch space: a mirror copying "clash.jpg.part" across next to a
+    # generated "clash.jpg" used to lose the copy without a word.
+    scratch = tmp / "atomic2"
+    scratch.mkdir()
+    decoy = scratch / f"clash.jpg{PART_SUFFIX}"
+    decoy.write_bytes(b"user data")
+    write_atomic(scratch / "clash.jpg", b"generated")
+    copy_atomic(source, scratch / "clash2.jpg")
+    check(decoy.read_bytes() == b"user data",
+          "writing clash.jpg clobbered the user's file clash.jpg.part")
+
+    # A copy cut short must fail before it takes the real name.
+    import minjpg.common as common
+
+    real_copyfile = common.shutil.copyfile
+    common.shutil.copyfile = lambda a, b: Path(b).write_bytes(Path(a).read_bytes()[:10])
+    try:
+        copy_atomic(source, scratch / "short.jpg")
+        check(False, "a short copy should raise")
+    except OSError as exc:
+        print(f"  short copy refused: {str(exc)[:60]}")
+    finally:
+        common.shutil.copyfile = real_copyfile
+    check(not (scratch / "short.jpg").exists(),
+          "a short copy landed under the real name, looking complete")
+
+    # Timestamps travel with copies and with compressed mirror files.
+    old = 978307200  # 2001-01-01
+    os.utime(source, (old, old))
+    copy_atomic(source, scratch / "dated-copy.jpg")
+    converted = convert.convert(
+        source, scratch / "dated-convert.jpg",
+        ConvertSettings(passthrough=False, max_size=0),
+    )
+    for path in (scratch / "dated-copy.jpg", converted.output):
+        check(int(path.stat().st_mtime) == old, f"{path.name} lost its source's date")
+
+    # Permissions follow the umask like a plain write, not a private 0o600.
+    if os.name != "nt":
+        umask = os.umask(0)
+        os.umask(umask)
+        mode = (scratch / "clash.jpg").stat().st_mode & 0o777
+        check(mode == 0o666 & ~umask, f"written file has mode {oct(mode)}")
+
+    # A legal 254-character name must not fail because of its temp name.
+    long_name = scratch / ("y" * 250 + ".jpg")
+    try:
+        write_atomic(long_name, b"x")
+        check(long_name.read_bytes() == b"x", "a 254-character name was not written")
+    except OSError as exc:
+        check(False, f"a 254-character name failed: {exc}")
+
+    leftovers = [p.name for p in scratch.iterdir() if p.name.startswith(".minjpg-")]
+    check(not leftovers, f"temp files left behind: {leftovers}")
+    print("  temp names never clash, short copies never land, dates are kept")
+
+    from minjpg.common import is_disk_full
+
+    full = OSError(errno.ENOSPC, "No space left on device")
+    wrapped = PipelineError("cannot write")
+    wrapped.__cause__ = full
+    check(is_disk_full(full) and is_disk_full(wrapped),
+          "a full disk, even wrapped in a pipeline error, should be recognised")
+    check(not is_disk_full(OSError("permission denied")) and not is_disk_full(None),
+          "only a full disk counts as one")
 
 
 def main() -> int:

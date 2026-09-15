@@ -60,7 +60,7 @@ full-size one at quality 30.
 | Max long edge  | 3840    | Median long edge of the existing high-res originals     |
 | Quality        | 65      | Their median quality                                    |
 | Max size       | 600 KB  | Their p90 is 646 KB; set to 0 to let quality decide     |
-| Quality floor  | 40      | How far the search drops to honour the cap              |
+| Quality floor  | 40      | How far the search drops to honour the cap (never above Quality) |
 | Smoothing      | 0       | Smoothing pays off at thumbnail sizes, not at 3840 px   |
 
 Here the size cap is a *preference*, not a rule: if even quality 40 cannot meet
@@ -132,7 +132,8 @@ contain it; all three are refused with an explanation.
    **Re-do selected**. A quality override skips the search entirely — it still
    refuses to write anything above the hard cap.
 
-Sources whose name already ends in `_min` are never used as input, so re-running
+Sources whose name already ends in `_min` — or `_min-2`, `_min-3`…, the names a
+clash produces — are never used as input, so re-running
 over a finished folder does not compress the compressed. In the "next to their
 originals" layout they are still copied across, and if a generated thumbnail
 wants a name an existing file already has, the **existing file keeps its name**
@@ -148,25 +149,38 @@ compressed JPEG, every other file — videos, sidecars, notes — copied across
 untouched, so nothing in the tree is lost on the way.
 
 Sources may be JPEG, PNG, TIFF, WebP, BMP, GIF, PSD, JPEG2000, TGA and — with
-`pillow-heif` installed — HEIC/HEIF and AVIF. Multi-frame sources (animated GIF,
-multipage TIFF, layered PSD) use the first frame.
+`pillow-heif` installed — HEIC/HEIF and AVIF. A layered PSD uses its flattened
+image. A multi-page TIFF, or an animated GIF, WebP or PNG, cannot become one JPEG
+without losing frames, so it is copied across unchanged and its row says
+**kept original**. (The Thumbnails tab still makes a thumbnail of the first frame.)
 
 What it guarantees:
 
 - **Everything comes out sRGB.** A Display P3 or Adobe RGB source is converted
   through its embedded profile rather than being reinterpreted, which would leave
-  it dull and hue-shifted. A corrupt profile falls back to the raw pixels instead
-  of failing the file.
+  it dull and hue-shifted. CMYK and greyscale profiles are applied to the image in
+  its own colour mode. A corrupt profile falls back to the raw pixels instead of
+  failing the file.
+- **16-bit sources are scaled, not clipped.** A 16-bit greyscale scan becomes the
+  same greys in 8 bits rather than solid white, and the row notes the reduction.
+- **Nothing is silently left out.** An image that cannot be read — corrupt, or too
+  large for the decoder — is copied across unchanged instead, and its row says
+  **kept original**. The same happens to multi-frame files, as above.
+- **File dates are kept.** Copies and compressed files carry their source's
+  modification date; for anything without EXIF, that date is the only one there is.
 - **EXIF is kept** — camera, lens, date, exposure and GPS — unless you tick
   **Remove all metadata**. The orientation tag is reset to 1 because the rotation
   is baked into the pixels, the dimension tags are updated to the real output
-  size, and the stale embedded thumbnail is dropped.
+  size, and the stale embedded thumbnail is dropped. EXIF too large for a JPEG to
+  hold (64 KB) cannot be kept, and the row says so rather than dropping it quietly.
 - **Subfolders are mirrored**, empty ones included, and if two sources map to
   the same name (`photo.png` and `photo.tif`) the second becomes `photo-2.jpg`
   rather than overwriting the first.
 - **A JPEG that already fits** both the long edge and the size cap is copied
   verbatim — no generation loss. That is skipped when metadata is being stripped
   or the source needs a colour conversion, since a plain copy would defeat both.
+  It is judged by content, not name: a PNG or HEIC saved as `.jpg`, or a CMYK
+  JPEG, is converted properly instead of being copied.
 
 ## Not losing work
 
@@ -186,21 +200,34 @@ Both tabs share the same guards, so neither can quietly destroy files:
 - **A run that writes nothing leaves nothing.** Cancel before the first file, or
   have every image fail, and the empty run folder is removed again. Only ever an
   empty one — a folder with anything in it is never cleaned up.
-- **Copied files are verified.** Every file carried across is checked against its
-  source size afterwards, so a copy cut short by a full disk fails loudly
-  instead of landing truncated.
+- **An unfinished folder says so.** `_minjpg_INCOMPLETE.txt` is written into the
+  new folder before anything else and removed only once every file has been
+  written. Cancel, a failure, a crash, a power cut or closing the app all leave it
+  there, listing what is missing. While it is there, do not delete originals on
+  the strength of that folder. Re-doing a failed image successfully updates it.
+- **Problems are said out loud.** A run where files failed, were kept as
+  originals, or stopped early ends with a dialog, not just a line in the log.
+  Folders that cannot be read, and linked folders (which are not followed), are
+  listed before Start rather than turning up as empty folders in the mirror.
+- **A full disk stops the run.** The first "no space left" ends the batch instead
+  of failing every remaining file while the disk stays full.
+- **Copied files are verified before they land.** Every copy is checked against
+  its source's size before it takes its real name, so a copy cut short by a full
+  disk fails without leaving a truncated file behind.
 - **Name clashes are case-insensitive.** `photo.PNG` and `photo.png` become
   `photo.jpg` and `photo-2.jpg` rather than silently colliding on Windows or macOS.
 - **Pre-flight before every batch.** The output folder is probed for writability
-  before any work starts, and low free space produces a warning — one that counts
-  the bytes of a full-tree copy, not just the images.
-- **Only our own leftovers are cleaned up.** A `.part` file is deleted only when
-  its name is one this app would itself have written for a job in the current
-  scan. `.part` is also what browsers and download tools name files in progress,
-  and the output folder is wherever you pointed it, so nothing else is touched.
-- **Every write is atomic.** Files are written (or copied) to a sibling `.part`
-  and moved into place, so an interruption or a failure leaves the previous file
-  intact rather than truncated.
+  before any work starts, and low free space is shown in the Start dialog itself —
+  counting the bytes of a full-tree copy, not just the images.
+- **Nothing is swept up.** Work in progress goes to a randomly named
+  `.minjpg-….part` file created fresh in the new folder, so it can never land on a
+  real file — not even one of yours called `photo.jpg.part`. Scanning never
+  deletes anything; `.part` is also what browsers name downloads in progress.
+- **Every write is atomic and durable.** Files are written (or copied) to that
+  temp file, flushed to disk, and only then moved into place, so neither a crash
+  nor a power cut leaves a truncated or empty file under a real name. The flush
+  costs about a millisecond per file on an SSD — noticeable only when copying many
+  thousands of small files to a slow USB stick.
 - **Nothing changes mid-run.** While a batch is running, Scan, Browse, Re-do and
   Apply & save decline rather than repoint the work under way.
 - **The encoder cannot hang the app.** `cjpeg` is given 120 seconds per image;
@@ -360,8 +387,8 @@ MozJPEG is BSD/IJG licensed; see `vendor/LICENSE.mozjpeg.md`.
 ## Verifying
 
 ```bash
-.venv/bin/python tools/verify_convert.py              # 135 checks
-.venv/bin/python tools/verify_gui.py                  # 60 checks, needs a display
+.venv/bin/python tools/verify_convert.py              # 188 checks
+.venv/bin/python tools/verify_gui.py                  # 88 checks, needs a display
 .venv/bin/python tools/verify_against_examples.py --all   # _min: all 197 pairs
 ```
 
@@ -369,8 +396,12 @@ MozJPEG is BSD/IJG licensed; see `vendor/LICENSE.mozjpeg.md`.
 against a real Adobe RGB profile, EXIF keep/strip behaviour, the size cap and
 passthrough rules, run-folder naming and collision handling, the input/output
 overlap guards, both thumbnail layouts, the full-mirror copy, all of the
-destructive-write guards above, and the atomic write helpers. It also asserts the
-source tree is byte-for-byte unchanged after a run of each mode.
+destructive-write guards above, and the atomic write helpers — including temp
+names that cannot clash, short copies that never land, and kept file dates. It
+covers 16-bit sources, CMYK and greyscale profiles, multi-frame files kept whole,
+content-based passthrough, the fallback names reserved for unreadable images, and
+linked and unreadable folders. It also asserts the source tree is byte-for-byte
+unchanged after a run of each mode.
 
 `verify_gui.py` drives the real app: it builds both tabs, checks each refuses to
 act until both folders are named, runs every layout, and then asserts the input
@@ -378,8 +409,13 @@ tree is byte-for-byte and mtime unchanged, that repeat runs step aside with a
 suffix instead of overwriting, that Start's dialog names the folder it is about
 to create, that editing a folder *or any option* after Scan blocks Start, that
 "Re-do selected" cannot create the run folder before Start has confirmed it, and
-that a run which writes nothing removes its own empty folder. It skips itself
-without a display.
+that a run which writes nothing removes its own empty folder. It also checks that
+every row in the "beside" layout reports its own result; that a failure, a cancel
+and a full disk each leave the incomplete marker (and a successful re-do removes
+it); that an unreadable image is carried across as **kept original**; that one
+bad event cannot freeze a tab; and that an EXIF-rotated photo previews upright.
+It skips itself without a display. Both scripts take `--data DIR` to point at a
+folder of sample JPEGs other than `../example_data`.
 
 This compresses real originals from `../example_data` and prints the result
 next to the hand-made Squoosh `_min.jpg`, asserting every generated file is

@@ -10,7 +10,7 @@ more input formats, colour-profile conversion, and metadata preservation.
 from __future__ import annotations
 
 import io
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from PIL import Image, ImageCms, ImageOps
@@ -30,6 +30,18 @@ _PIXEL_X, _PIXEL_Y = 0xA002, 0xA003  # 40962, 40963
 _APP1_LIMIT = 65_533
 
 _SRGB = ImageCms.createProfile("sRGB")
+
+#: Modes a colour profile can be applied to directly.  A CMYK or greyscale
+#: profile describes CMYK or greyscale numbers, not RGB ones.
+_PROFILE_MODES = ("RGB", "CMYK", "L")
+
+
+class KeepOriginal(PipelineError):
+    """This source is better carried across unchanged than converted.
+
+    Raised rather than returned so the batch's usual fallback — copying the
+    original into the mirror — handles it exactly as it does an unreadable file.
+    """
 
 
 @dataclass
@@ -59,35 +71,61 @@ class ConvertResult:
         return "done"
 
 
+@dataclass
+class Source:
+    """A decoded source, and what was learned about it on the way in."""
+
+    image: Image.Image  # upright, sRGB, mode RGB
+    exif: Image.Exif | None
+    converted_colour: bool  # a non-sRGB profile was converted
+    format: str | None  # what the file really is, whatever its name says
+    mode: str  # as decoded, before any conversion
+    frames: int
+    notes: list[str] = field(default_factory=list)
+
+
+def _as_rgb(image: Image.Image) -> Image.Image:
+    return image if image.mode == "RGB" else image.convert("RGB")
+
+
 def to_srgb(image: Image.Image, profile: bytes | None) -> tuple[Image.Image, bool]:
     """Convert to sRGB, honouring ``profile`` if there is one.
 
     Without this, a Display P3 or Adobe RGB source is treated as if its numbers
-    were already sRGB and comes out dull and hue-shifted.  Broken profiles are
-    common in the wild, so a failure here falls back to the raw pixels rather
-    than failing the file.
+    were already sRGB and comes out dull and hue-shifted.  The transform is
+    tried on the numbers in their own mode first — a CMYK or greyscale profile
+    cannot apply to RGB, and converting to RGB beforehand made every such
+    transform fail — then on RGB, which is all the old code tried.  Broken
+    profiles are common in the wild, so a failure here falls back to the raw
+    pixels rather than failing the file.
     """
-    as_rgb = image.convert("RGB") if image.mode != "RGB" else image
     if not profile:
-        return as_rgb, False
-
+        return _as_rgb(image), False
     try:
         source_profile = ImageCms.ImageCmsProfile(io.BytesIO(profile))
-        if ImageCms.getProfileDescription(source_profile).strip().startswith("sRGB"):
-            return as_rgb, False
-        converted = ImageCms.profileToProfile(
-            as_rgb, source_profile, _SRGB, outputMode="RGB"
-        )
+        is_srgb = ImageCms.getProfileDescription(source_profile).strip().startswith("sRGB")
+    except Exception:
+        return _as_rgb(image), False  # unusable profile - treat the numbers as sRGB
+    if is_srgb:
+        return _as_rgb(image), False
+
+    own = image.mode if image.mode in _PROFILE_MODES else "RGB"
+    for mode in dict.fromkeys((own, "RGB")):
+        try:
+            candidate = image if image.mode == mode else image.convert(mode)
+            converted = ImageCms.profileToProfile(
+                candidate, source_profile, _SRGB, outputMode="RGB"
+            )
+        except Exception:
+            continue
         if converted is not None:
             return converted, True
-    except Exception:
-        pass  # unusable profile - treat the numbers as sRGB, which is the old behaviour
-    return as_rgb, False
+    return _as_rgb(image), False
 
 
 def flatten_alpha(image: Image.Image) -> Image.Image:
     """Composite transparency onto white."""
-    if image.mode in ("RGBA", "LA") or (
+    if image.mode in ("RGBA", "LA", "PA") or (
         image.mode == "P" and "transparency" in image.info
     ):
         image = image.convert("RGBA")
@@ -96,20 +134,25 @@ def flatten_alpha(image: Image.Image) -> Image.Image:
     return image
 
 
-def load_source(path: Path) -> tuple[Image.Image, Image.Exif | None, bool]:
-    """Open a source as upright sRGB RGB, returning its EXIF alongside.
+def load_source(path: Path) -> Source:
+    """Open a source as upright sRGB RGB, noting what it was on the way.
 
-    Order matters: transparency has to be composited *before* the colour
+    Order matters: 16-bit and floating-point values are scaled to 8 bits before
+    anything else can clip them; transparency is composited *before* the colour
     conversion, because converting to RGB discards the alpha channel rather than
-    compositing it.  White is white in every RGB space, so flattening first is
-    safe.
+    compositing it (white is white in every RGB space, so flattening first is
+    safe); and the profile is applied last, to numbers in their own mode.
     """
     opened = formats.open_image(path)
+    source_format, source_mode = opened.format, opened.mode
+    frames = formats.frame_count(opened)
     exif = opened.getexif() if opened.info.get("exif") else None
     profile = opened.info.get("icc_profile")
     upright = ImageOps.exif_transpose(opened) or opened
-    srgb, converted = to_srgb(flatten_alpha(upright), profile)
-    return srgb, exif, converted
+    image = formats.to_8bit(upright)
+    notes = [f"{source_mode} source reduced to 8 bits"] if image is not upright else []
+    srgb, converted = to_srgb(flatten_alpha(image), profile)
+    return Source(srgb, exif, converted, source_format, source_mode, frames, notes)
 
 
 def build_exif_payload(exif: Image.Exif, output_size: tuple[int, int]) -> bytes | None:
@@ -171,14 +214,18 @@ def _search_quality(
     if not settings.max_size or len(data) <= budget:
         return quality, data, False
 
-    floor_data = encoder.encode(frame, settings.quality_floor, settings.smoothing)
+    floor = settings.effective_floor
+    if floor >= quality:
+        return quality, data, True  # no room to search downwards
+
+    floor_data = encoder.encode(frame, floor, settings.smoothing)
     if len(floor_data) > budget:
         # Nothing in range fits.  Hand back the floor result; the caller writes
         # it and flags the row rather than silently dropping the image.
-        return settings.quality_floor, floor_data, True
+        return floor, floor_data, True
 
-    best_quality, best_data = settings.quality_floor, floor_data
-    low, high = settings.quality_floor + 1, quality - 1
+    best_quality, best_data = floor, floor_data
+    low, high = floor + 1, quality - 1
     while low <= high:
         mid = (low + high) // 2
         data = encoder.encode(frame, mid, settings.smoothing)
@@ -199,29 +246,40 @@ def convert(
 ) -> ConvertResult:
     """Convert one file. ``long_edge``/``quality`` are per-image GUI overrides."""
     try:
-        image, exif, converted_colour = load_source(source)
+        loaded = load_source(source)
     except Exception as exc:
         raise PipelineError(f"cannot read: {exc}") from exc
 
+    if loaded.frames > 1 and loaded.format in formats.PAGED_FORMATS:
+        # A JPEG holds one picture.  Converting the first frame would quietly
+        # drop the rest from a folder that is meant to be a full copy.
+        raise KeepOriginal(
+            f"{formats.describe_frames(loaded.format, loaded.frames)}: "
+            "kept as it is so no frame is lost"
+        )
+
+    image = loaded.image
     source_size = image.size
     cap = long_edge if long_edge else settings.max_long_edge
     size = resize.target_size(source_size, cap)
 
-    if _can_pass_through(
-        source, settings, size, source_size, long_edge, quality, converted_colour
-    ):
-        copy_atomic(source, output)
+    if _can_pass_through(source, settings, size, source_size, long_edge, quality, loaded):
+        copied = copy_atomic(source, output)
         return ConvertResult(
-            source, output, source_size, source_size, output.stat().st_size,
+            source, output, source_size, source_size, copied,
             quality=0, copied=True, metadata_kept=True,
             notes="already within the long edge and size cap",
         )
 
     frame = resize.resize(image, size, settings.linear_light_resize)
 
+    notes = list(loaded.notes)
     payload = None
-    if exif is not None and not settings.strip_metadata:
-        payload = build_exif_payload(exif, size)
+    if loaded.exif is not None and not settings.strip_metadata:
+        payload = build_exif_payload(loaded.exif, size)
+        if payload is None:
+            # Asked to keep it and could not: say so rather than drop it quietly.
+            notes.append("EXIF could not be kept (too large for a JPEG, or unreadable)")
     overhead = len(payload) + 4 if payload else 0
 
     if quality is not None:
@@ -235,9 +293,10 @@ def convert(
     if payload:
         data = inject_exif(data, payload)
 
-    write_atomic(output, data)
-    notes = []
-    if converted_colour:
+    # The run folder is a mirror of the input, so the file keeps its source's
+    # date: for anything without EXIF, that date is the only one there is.
+    write_atomic(output, data, times_from=source)
+    if loaded.converted_colour:
         notes.append("converted to sRGB")
     if over_cap:
         # An override skips the search entirely, so blaming the quality floor
@@ -245,7 +304,7 @@ def convert(
         reason = (
             f"at the quality {used_quality} you asked for"
             if quality is not None
-            else f"even at the quality floor {settings.quality_floor}"
+            else f"even at the quality floor {settings.effective_floor}"
         )
         notes.append(
             f"{len(data) / 1024:.1f} KB exceeds the "
@@ -253,7 +312,7 @@ def convert(
         )
     return ConvertResult(
         source, output, source_size, size, len(data), used_quality,
-        over_cap=over_cap, converted_colour=converted_colour,
+        over_cap=over_cap, converted_colour=loaded.converted_colour,
         metadata_kept=bool(payload), notes="; ".join(notes),
     )
 
@@ -265,23 +324,28 @@ def _can_pass_through(
     source_size: tuple[int, int],
     long_edge: int | None,
     quality: int | None,
-    converted_colour: bool,
+    loaded: Source,
 ) -> bool:
     """Is re-encoding this file pointless?
 
-    Only for JPEGs that already fit both limits.  Copying keeps the source's own
-    metadata, so it is off when metadata is meant to be stripped, and an
-    explicit per-image override always means the user wants a real re-encode.
+    Only for JPEGs that already fit both limits — judged by content rather than
+    name, since a PNG or HEIC saved as ".jpg" would otherwise be copied as it
+    is, and only RGB or greyscale ones, since a CMYK JPEG is no web image.
+    Copying keeps the source's own metadata, so it is off when metadata is
+    meant to be stripped, and an explicit per-image override always means the
+    user wants a real re-encode.
 
     It is also off when the source needed a colour conversion: copying an Adobe
     RGB or Display P3 file verbatim would quietly break the promise that
     everything written here is sRGB.
     """
-    if not settings.passthrough or settings.strip_metadata or converted_colour:
+    if not settings.passthrough or settings.strip_metadata or loaded.converted_colour:
         return False
     if long_edge is not None or quality is not None:
         return False
     if source.suffix.lower() not in (".jpg", ".jpeg", ".jpe", ".jfif"):
+        return False
+    if loaded.format not in ("JPEG", "MPO") or loaded.mode not in ("RGB", "L"):
         return False
     if size != source_size:
         return False
