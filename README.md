@@ -168,11 +168,17 @@ What it guarantees:
   **kept original**. The same happens to multi-frame files, as above.
 - **File dates are kept.** Copies and compressed files carry their source's
   modification date; for anything without EXIF, that date is the only one there is.
-- **EXIF is kept** — camera, lens, date, exposure and GPS — unless you tick
-  **Remove all metadata**. The orientation tag is reset to 1 because the rotation
-  is baked into the pixels, the dimension tags are updated to the real output
-  size, and the stale embedded thumbnail is dropped. EXIF too large for a JPEG to
-  hold (64 KB) cannot be kept, and the row says so rather than dropping it quietly.
+- **Metadata is kept** unless you tick **Remove all metadata**: EXIF (camera,
+  lens, date, exposure, GPS), XMP (captions, keywords, ratings, colour labels and
+  develop settings from Lightroom, Bridge, Capture One, darktable and the like)
+  and IPTC (the older caption and keyword block the same apps still write). What
+  the conversion changes is corrected in all of them: the orientation is reset to
+  1 because the rotation is baked into the pixels, dimensions are updated to the
+  real output size, the colour space says sRGB after a conversion, and stale
+  embedded thumbnails are dropped. A JPEG holds at most 64 KB per block, so XMP
+  that does not fit first loses what nobody typed — Camera Raw develop settings,
+  edit history, thumbnails — and keeps captions, keywords and ratings. Anything
+  that still cannot be kept is named in the row rather than dropped quietly.
 - **Subfolders are mirrored**, empty ones included, and if two sources map to
   the same name (`photo.png` and `photo.tif`) the second becomes `photo-2.jpg`
   rather than overwriting the first.
@@ -387,7 +393,7 @@ MozJPEG is BSD/IJG licensed; see `vendor/LICENSE.mozjpeg.md`.
 ## Verifying
 
 ```bash
-.venv/bin/python tools/verify_convert.py              # 188 checks
+.venv/bin/python tools/verify_convert.py              # 211 checks
 .venv/bin/python tools/verify_gui.py                  # 88 checks, needs a display
 .venv/bin/python tools/verify_against_examples.py --all   # _min: all 197 pairs
 ```
@@ -398,7 +404,9 @@ passthrough rules, run-folder naming and collision handling, the input/output
 overlap guards, both thumbnail layouts, the full-mirror copy, all of the
 destructive-write guards above, and the atomic write helpers — including temp
 names that cannot clash, short copies that never land, and kept file dates. It
-covers 16-bit sources, CMYK and greyscale profiles, multi-frame files kept whole,
+covers XMP and IPTC carried across from JPEG, PNG, WebP, TIFF and HEIC (captions,
+keywords, ratings, with stale facts corrected and oversized packets slimmed),
+16-bit sources, CMYK and greyscale profiles, multi-frame files kept whole,
 content-based passthrough, the fallback names reserved for unreadable images, and
 linked and unreadable folders. It also asserts the source tree is byte-for-byte
 unchanged after a run of each mode.

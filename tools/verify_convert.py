@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import errno
+import io
 import os
 import shutil
 import sys
@@ -18,7 +19,7 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageCms, JpegImagePlugin
+from PIL import Image, ImageCms, IptcImagePlugin, JpegImagePlugin, PngImagePlugin
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -202,7 +203,21 @@ def test_wide_gamut(tmp: Path, out: Path) -> None:
     if profile_path:
         profile = Path(profile_path).read_bytes()
         source = tmp / "wide.jpg"
-        Image.new("RGB", (600, 400), colour).save(source, icc_profile=profile, quality=98)
+        # Tagged the way an Adobe RGB camera or export tags it, so the
+        # colour-space facts can be seen to change along with the pixels.
+        wide_exif = Image.Exif()
+        wide_exif.get_ifd(0x8769)[0xA001] = 0xFFFF  # ColorSpace: uncalibrated
+        wide_xmp = (
+            '<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF '
+            'xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description '
+            'rdf:about="" xmlns:photoshop="http://ns.adobe.com/photoshop/1.0/" '
+            'xmlns:exif="http://ns.adobe.com/exif/1.0/" '
+            'photoshop:ICCProfile="Adobe RGB (1998)" exif:ColorSpace="65535"/>'
+            "</rdf:RDF></x:xmpmeta>"
+        ).encode()
+        Image.new("RGB", (600, 400), colour).save(
+            source, icc_profile=profile, exif=wide_exif, xmp=wide_xmp, quality=98
+        )
 
         # What the numbers should become once interpreted in the wide space.
         expected = ImageCms.profileToProfile(
@@ -225,6 +240,15 @@ def test_wide_gamut(tmp: Path, out: Path) -> None:
         # copied through: Adobe RGB green shifts ~10 in blue, so 4 is a safe bar.
         check(any(abs(a - b) >= 4 for a, b in zip(got, colour)),
               f"output {got} is unchanged from the raw numbers - no conversion happened")
+        with Image.open(result.output) as written:
+            wide_out = (written.info.get("xmp") or b"").decode("utf-8")
+            colour_space = written.getexif().get_ifd(0x8769).get(0xA001)
+        print(f"  colour-space facts after conversion: EXIF {colour_space}, "
+              f"XMP ICCProfile {'sRGB' if 'sRGB IEC61966-2.1' in wide_out else 'unchanged'}")
+        check(colour_space == 1, f"EXIF ColorSpace is {colour_space} after converting to sRGB")
+        check('photoshop:ICCProfile="sRGB IEC61966-2.1"' in wide_out
+              and 'exif:ColorSpace="1"' in wide_out,
+              "the XMP still names the profile the colours were converted away from")
     else:
         print("  (no wide-gamut ICC profile on this system, skipping)")
 
@@ -329,6 +353,126 @@ def test_metadata(tmp: Path, out: Path) -> None:
     # orientation 6 means the pixels must come out rotated: portrait source
     check(out_size[0] < out_size[1],
           f"orientation 6 was not applied: output {out_size} is not portrait")
+
+    # XMP and IPTC: where Lightroom, Bridge, Capture One and the like put a
+    # caption, keywords or a rating.  Both are kept, with the facts the
+    # conversion changes brought up to date.
+    def lightroom_xmp(extra_attributes: str = "", caption: str = "Harbour at dawn") -> bytes:
+        return (
+            '<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>\n'
+            '<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF '
+            'xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">\n'
+            '<rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" '
+            'xmlns:dc="http://purl.org/dc/elements/1.1/" '
+            'xmlns:lr="http://ns.adobe.com/lightroom/1.0/" '
+            'xmlns:tiff="http://ns.adobe.com/tiff/1.0/" '
+            'xmlns:exif="http://ns.adobe.com/exif/1.0/" '
+            'xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/" '
+            'xmp:Rating="4" xmp:Label="Red" tiff:Orientation="6" '
+            'exif:PixelXDimension="900" exif:PixelYDimension="600" '
+            f'crs:Exposure2012="+0.50"{extra_attributes}>\n'
+            '<dc:description><rdf:Alt><rdf:li xml:lang="x-default">'
+            f"{caption}</rdf:li></rdf:Alt></dc:description>\n"
+            "<dc:subject><rdf:Bag><rdf:li>harbour</rdf:li><rdf:li>dawn</rdf:li>"
+            "</rdf:Bag></dc:subject>\n"
+            "<lr:hierarchicalSubject><rdf:Bag><rdf:li>Places|Harbour</rdf:li>"
+            "</rdf:Bag></lr:hierarchicalSubject>\n"
+            "</rdf:Description></rdf:RDF></x:xmpmeta>\n"
+            + " " * 2048 + '\n<?xpacket end="w"?>'
+        ).encode("utf-8")
+
+    def with_iptc(jpeg: bytes) -> bytes:
+        """Splice in an APP13 block the way Photoshop and Lightroom write one."""
+        def dataset(number: int, value: bytes) -> bytes:
+            return b"\x1c\x02" + bytes([number]) + len(value).to_bytes(2, "big") + value
+
+        iim = (b"\x1c\x01\x5a\x00\x03\x1b%G"  # 1:90 character set: UTF-8
+               + dataset(120, "Harbour at dawn".encode()) + dataset(25, b"harbour")
+               + dataset(25, b"dawn"))
+        block = b"8BIM\x04\x04\x00\x00" + len(iim).to_bytes(4, "big") + iim + b"\x00" * (len(iim) % 2)
+        payload = b"Photoshop 3.0\x00" + block
+        return jpeg[:2] + b"\xff\xed" + (len(payload) + 2).to_bytes(2, "big") + payload + jpeg[2:]
+
+    def metadata_order(path: Path) -> list[str]:
+        """The metadata segments before the image data, read straight off the bytes."""
+        data, found, position = path.read_bytes(), [], 2
+        while data[position] == 0xFF and data[position + 1] not in (0xDA, 0xD9):
+            marker = data[position + 1]
+            head = data[position + 4 : position + 33]
+            if marker == 0xE1:
+                found.append("EXIF" if head.startswith(b"Exif") else "XMP")
+            elif marker == 0xED:
+                found.append("IPTC")
+            position += 2 + int.from_bytes(data[position + 2 : position + 4], "big")
+        return found
+
+    def png_with_xmp(path: Path, packet: bytes) -> None:
+        info = PngImagePlugin.PngInfo()
+        info.add_itxt("XML:com.adobe.xmp", packet.decode("utf-8"))
+        image.save(path, pnginfo=info)
+
+    tagged = tmp / "lightroom.jpg"
+    buffer = io.BytesIO()
+    image.save(buffer, "JPEG", exif=exif, xmp=lightroom_xmp(), quality=95)
+    tagged.write_bytes(with_iptc(buffer.getvalue()))
+    r = convert.convert(tagged, out / "lightroom.jpg", keep)
+    with Image.open(r.output) as written:
+        xmp_out = (written.info.get("xmp") or b"").decode("utf-8")
+        iptc_out = IptcImagePlugin.getiptcinfo(written) or {}
+        lr_size = written.size
+    print(f"  Lightroom-style source: kept {r.kept_metadata!r}, {lr_size}, notes={r.notes!r}")
+    for expected in ("Harbour at dawn", "<rdf:li>harbour</rdf:li>", 'xmp:Rating="4"',
+                     'xmp:Label="Red"', "Places|Harbour", 'crs:Exposure2012="+0.50"'):
+        check(expected in xmp_out, f"the XMP lost {expected!r}")
+    check('tiff:Orientation="1"' in xmp_out, "XMP orientation must be 1 once the rotation is baked in")
+    check(f'exif:PixelXDimension="{lr_size[0]}"' in xmp_out
+          and f'exif:PixelYDimension="{lr_size[1]}"' in xmp_out,
+          "the XMP dimensions must match the output")
+    check(" " * 100 not in xmp_out, "the XMP editing padding should be trimmed")
+    check(iptc_out.get((2, 120)) == b"Harbour at dawn", f"IPTC caption is {iptc_out.get((2, 120))!r}")
+    check(iptc_out.get((2, 25)) == [b"harbour", b"dawn"], f"IPTC keywords are {iptc_out.get((2, 25))!r}")
+    check(r.kept_metadata == "EXIF, XMP, IPTC", f"kept {r.kept_metadata!r}")
+    order = metadata_order(r.output)
+    check(order == ["EXIF", "XMP", "IPTC"], f"metadata segments are {order}")
+
+    stripped_lr = convert.convert(
+        tagged, out / "lightroom-strip.jpg",
+        ConvertSettings(max_long_edge=400, quality=70, max_size=0, strip_metadata=True),
+    )
+    check(metadata_order(stripped_lr.output) == [],
+          "'Remove all metadata' left EXIF, XMP or IPTC behind")
+
+    # Every format that carries XMP hands it on.
+    carriers = [("webp", {"xmp": lightroom_xmp()}), ("tif", {"tiffinfo": {700: lightroom_xmp()}})]
+    if formats.HEIF_AVAILABLE:
+        carriers.append(("heic", {"xmp": lightroom_xmp(), "quality": 90}))
+    png_with_xmp(tmp / "lightroom.png", lightroom_xmp())
+    for ext, kwargs in carriers:
+        image.save(tmp / f"lightroom.{ext}", **kwargs)
+    for ext in [ext for ext, _ in carriers] + ["png"]:
+        r = convert.convert(tmp / f"lightroom.{ext}", out / f"lightroom-{ext}.jpg", keep)
+        with Image.open(r.output) as written:
+            carried = (written.info.get("xmp") or b"").decode("utf-8")
+        check("Harbour at dawn" in carried and 'xmp:Rating="4"' in carried,
+              f"{ext}: the XMP was not carried across (kept {r.kept_metadata!r})")
+    print(f"  XMP carried across from {', '.join([e for e, _ in carriers] + ['png'])}")
+
+    # Too big for one JPEG segment: the bulk nobody typed goes, the caption,
+    # keywords and rating stay - and the row says what happened.
+    curve = ' crs:ToneCurvePV2012="' + "0, 0, " * 14000 + '"'
+    png_with_xmp(tmp / "lightroom-big.png", lightroom_xmp(curve))
+    r = convert.convert(tmp / "lightroom-big.png", out / "lightroom-big.jpg", keep)
+    with Image.open(r.output) as written:
+        slim = (written.info.get("xmp") or b"").decode("utf-8")
+    print(f"  oversized XMP: kept {r.kept_metadata!r}, notes={r.notes!r}")
+    check("Harbour at dawn" in slim and 'xmp:Rating="4"' in slim and "harbour" in slim,
+          "shrinking the XMP lost the caption, keywords or rating")
+    check("ToneCurvePV2012" not in slim and "develop settings" in r.notes,
+          "the bulky develop settings should go, and the row should say so")
+    png_with_xmp(tmp / "lightroom-huge.png", lightroom_xmp(caption="x" * 70_000))
+    r = convert.convert(tmp / "lightroom-huge.png", out / "lightroom-huge.jpg", keep)
+    check("XMP could not be kept" in r.notes and "XMP" not in r.kept_metadata,
+          f"XMP that cannot fit must be reported: {r.notes!r}")
 
     # EXIF too big for a JPEG's APP1 segment cannot be kept - and says so.
     bulky = Image.Exif()

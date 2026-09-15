@@ -266,7 +266,8 @@ class CompressTab(FolderTab):
             self,
             text=(
                 f"Everything is converted to sRGB. {formats.describe_support()}. "
-                "EXIF is kept unless 'Remove all metadata' is ticked."
+                "EXIF, XMP and IPTC (GPS, captions, keywords, ratings) are kept "
+                "unless 'Remove all metadata' is ticked."
             ),
             foreground="grey40",
         ).pack(fill="x")
@@ -340,7 +341,7 @@ class CompressTab(FolderTab):
         else:
             message += f" at quality {result.quality}"
             if result.metadata_kept:
-                message += ", EXIF kept"
+                message += f", {result.kept_metadata} kept"
         if result.notes:
             message += f" — {result.notes}"
         return result.status, message

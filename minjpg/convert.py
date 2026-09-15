@@ -15,7 +15,7 @@ from pathlib import Path
 
 from PIL import Image, ImageCms, ImageOps
 
-from . import encoder, formats, resize
+from . import encoder, formats, metadata, resize
 from .config import ConvertSettings
 from .common import PipelineError, copy_atomic, write_atomic
 
@@ -25,9 +25,7 @@ _TIFF_WIDTH, _TIFF_HEIGHT = 0x0100, 0x0101  # 256, 257
 _THUMBNAIL_TAGS = (0x0201, 0x0202)  # 513, 514 - offset + length of the JPEG thumbnail
 _EXIF_IFD = 0x8769
 _PIXEL_X, _PIXEL_Y = 0xA002, 0xA003  # 40962, 40963
-
-#: An APP1 segment's payload cannot exceed this (2-byte length field, minus itself).
-_APP1_LIMIT = 65_533
+_COLOR_SPACE = 0xA001  # 40961: 1 = sRGB, 0xFFFF = uncalibrated (how Adobe RGB is marked)
 
 _SRGB = ImageCms.createProfile("sRGB")
 
@@ -57,6 +55,7 @@ class ConvertResult:
     converted_colour: bool = False  # a non-sRGB profile was converted
     metadata_kept: bool = False
     notes: str = ""
+    kept_metadata: str = ""  # which blocks were carried across, e.g. "EXIF, XMP, IPTC"
 
     @property
     def kilobytes(self) -> float:
@@ -82,6 +81,9 @@ class Source:
     mode: str  # as decoded, before any conversion
     frames: int
     notes: list[str] = field(default_factory=list)
+    xmp: bytes | None = None
+    iptc: bytes | None = None
+    iptc_digest: bytes | None = None
 
 
 def _as_rgb(image: Image.Image) -> Image.Image:
@@ -148,16 +150,32 @@ def load_source(path: Path) -> Source:
     frames = formats.frame_count(opened)
     exif = opened.getexif() if opened.info.get("exif") else None
     profile = opened.info.get("icc_profile")
+    notes = []
+    try:
+        xmp = metadata.read_xmp(opened)
+        iptc, iptc_digest = metadata.read_iptc(opened)
+    except Exception:
+        # Metadata that cannot be read must never cost the image itself.
+        xmp = iptc = iptc_digest = None
+        notes.append("XMP/IPTC could not be read")
     upright = ImageOps.exif_transpose(opened) or opened
     image = formats.to_8bit(upright)
-    notes = [f"{source_mode} source reduced to 8 bits"] if image is not upright else []
+    if image is not upright:
+        notes.append(f"{source_mode} source reduced to 8 bits")
     srgb, converted = to_srgb(flatten_alpha(image), profile)
-    return Source(srgb, exif, converted, source_format, source_mode, frames, notes)
+    return Source(
+        srgb, exif, converted, source_format, source_mode, frames, notes,
+        xmp=xmp, iptc=iptc, iptc_digest=iptc_digest,
+    )
 
 
-def build_exif_payload(exif: Image.Exif, output_size: tuple[int, int]) -> bytes | None:
-    """Serialise EXIF for re-injection, fixing what resizing invalidated.
+def build_exif_payload(
+    exif: Image.Exif, output_size: tuple[int, int], srgb: bool = False
+) -> bytes | None:
+    """Serialise EXIF for re-injection, fixing what the conversion invalidated.
 
+    ``srgb`` means the colours were converted from another profile, so a
+    colour-space tag still saying "uncalibrated" (Adobe RGB) would be a lie.
     Returns ``None`` when there is nothing worth writing or the result would
     exceed what an APP1 segment can hold.
     """
@@ -170,6 +188,8 @@ def build_exif_payload(exif: Image.Exif, output_size: tuple[int, int]) -> bytes 
         sub = exif.get_ifd(_EXIF_IFD)
         if sub:
             sub[_PIXEL_X], sub[_PIXEL_Y] = output_size
+            if srgb:
+                sub[_COLOR_SPACE] = 1
     except Exception:
         pass
 
@@ -182,22 +202,42 @@ def build_exif_payload(exif: Image.Exif, output_size: tuple[int, int]) -> bytes 
     # Pillow >= 10 includes the marker; older versions return a bare TIFF block.
     if not payload.startswith(b"Exif\x00\x00"):
         payload = b"Exif\x00\x00" + payload
-    return payload if len(payload) <= _APP1_LIMIT else None
+    return payload if len(payload) <= metadata.SEGMENT_LIMIT else None
 
 
-def inject_exif(jpeg: bytes, payload: bytes) -> bytes:
-    """Splice an APP1 EXIF segment into a JPEG produced by cjpeg.
+def _metadata_segments(
+    loaded: Source, size: tuple[int, int], notes: list[str]
+) -> tuple[list[bytes], list[str]]:
+    """The EXIF, XMP and IPTC segments to splice in, and which of them made it.
 
-    cjpeg reads PPM, so its output carries no metadata at all; the segment goes
-    in after any APP0 (JFIF) segment, which is where readers expect it.
+    cjpeg reads PPM, so its output carries no metadata at all.  Anything the
+    user asked to keep that could not be kept is added to ``notes`` rather
+    than dropped quietly.
     """
-    if jpeg[:2] != b"\xff\xd8":
-        return jpeg
-    position = 2
-    while jpeg[position : position + 2] == b"\xff\xe0":
-        position += 2 + int.from_bytes(jpeg[position + 2 : position + 4], "big")
-    segment = b"\xff\xe1" + (len(payload) + 2).to_bytes(2, "big") + payload
-    return jpeg[:position] + segment + jpeg[position:]
+    segments: list[bytes] = []
+    kept: list[str] = []
+    if loaded.exif is not None:
+        payload = build_exif_payload(loaded.exif, size, srgb=loaded.converted_colour)
+        if payload is None:
+            notes.append("EXIF could not be kept (too large for a JPEG, or unreadable)")
+        else:
+            segments.append(metadata.segment(metadata.APP1, payload))
+            kept.append("EXIF")
+    if loaded.xmp:
+        xmp, note = metadata.xmp_segment(loaded.xmp, size, loaded.converted_colour)
+        if note:
+            notes.append(note)
+        if xmp:
+            segments.append(xmp)
+            kept.append("XMP")
+    if loaded.iptc:
+        iptc = metadata.iptc_segment(loaded.iptc, loaded.iptc_digest)
+        if iptc:
+            segments.append(iptc)
+            kept.append("IPTC")
+        else:
+            notes.append("IPTC could not be kept (too large for a JPEG)")
+    return segments, kept
 
 
 def _search_quality(
@@ -274,13 +314,11 @@ def convert(
     frame = resize.resize(image, size, settings.linear_light_resize)
 
     notes = list(loaded.notes)
-    payload = None
-    if loaded.exif is not None and not settings.strip_metadata:
-        payload = build_exif_payload(loaded.exif, size)
-        if payload is None:
-            # Asked to keep it and could not: say so rather than drop it quietly.
-            notes.append("EXIF could not be kept (too large for a JPEG, or unreadable)")
-    overhead = len(payload) + 4 if payload else 0
+    segments, kept = (
+        ([], []) if settings.strip_metadata else _metadata_segments(loaded, size, notes)
+    )
+    # The cap applies to the file that lands on disk, metadata and all.
+    overhead = sum(len(segment) for segment in segments)
 
     if quality is not None:
         data = encoder.encode(frame, quality, settings.smoothing)
@@ -290,8 +328,8 @@ def convert(
     else:
         used_quality, data, over_cap = _search_quality(frame, settings, overhead)
 
-    if payload:
-        data = inject_exif(data, payload)
+    if segments:
+        data = metadata.inject(data, segments)
 
     # The run folder is a mirror of the input, so the file keeps its source's
     # date: for anything without EXIF, that date is the only one there is.
@@ -313,7 +351,7 @@ def convert(
     return ConvertResult(
         source, output, source_size, size, len(data), used_quality,
         over_cap=over_cap, converted_colour=loaded.converted_colour,
-        metadata_kept=bool(payload), notes="; ".join(notes),
+        metadata_kept=bool(kept), kept_metadata=", ".join(kept), notes="; ".join(notes),
     )
 
 
