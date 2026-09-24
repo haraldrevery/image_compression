@@ -52,12 +52,21 @@ def same_name(source: Path) -> str:
 
 #: A thumbnail's stem ends in ``_min`` — or ``_min-2``, ``_min-3``… when a name
 #: clash renamed it.  Missing the renamed ones let a re-run over an output
-#: folder make thumbnails of thumbnails.
-_MIN_STEM = re.compile(rf"{re.escape(MIN_SUFFIX)}(-\d+)?$", re.IGNORECASE)
+#: folder make thumbnails of thumbnails.  The clash number is kept short, so a
+#: photo called ``trip_min-2024`` is not mistaken for one.
+_MIN_STEM = re.compile(rf"{re.escape(MIN_SUFFIX)}(-\d{{1,3}})?$", re.IGNORECASE)
+
+#: Thumbnails are only ever JPEGs; a PNG named ``_min`` is someone's own file.
+_MIN_EXTENSIONS = frozenset({".jpg", ".jpeg"})
+
+#: The start of an AppleDouble file's name: the Finder data a Mac writes beside
+#: each file on a drive that cannot hold it natively.  It keeps the photo's
+#: extension (``._IMG_0001.jpg``) but is never an image.
+_APPLEDOUBLE_PREFIX = "._"
 
 
 def is_min_file(path: Path) -> bool:
-    return bool(_MIN_STEM.search(path.stem))
+    return path.suffix.lower() in _MIN_EXTENSIONS and bool(_MIN_STEM.search(path.stem))
 
 
 @dataclass
@@ -83,6 +92,9 @@ class ScanResult:
     empty_dirs: list[Path] = field(default_factory=list)
     #: The batch looks likely to run out of disk space.
     low_space: bool = False
+    #: The run folder is meant to hold everything in the input, so the finished
+    #: run is checked against the input before it counts as complete.
+    mirror: bool = False
 
     def __len__(self) -> int:
         return len(self.jobs)
@@ -116,6 +128,14 @@ class ScanError(ValueError):
     """The folders given cannot be scanned as asked."""
 
 
+class OutputFolderMissing(ScanError):
+    """The output folder does not exist; the interface may offer to create it."""
+
+    def __init__(self, folder: Path):
+        super().__init__(f"The output folder does not exist: {folder}")
+        self.folder = folder
+
+
 @dataclass
 class ScanSpec:
     """Everything the scan core needs, independent of which tab asked."""
@@ -133,6 +153,11 @@ class ScanSpec:
     copy_extras: bool = False  # copy every non-image file across too
     space_per_job: int = 0  # rough bytes per processed output, for the warning
     fallback_copy: bool = False  # reserve a place for each original, see Job.fallback
+    #: Say how many files named like thumbnails are copied rather than processed.
+    report_min_copies: bool = False
+    #: Image extensions this job cannot use, counted and reported rather than
+    #: passed over in silence.
+    report_unused: frozenset[str] = frozenset()
 
 
 def _is_within(child: Path, parent: Path) -> bool:
@@ -179,11 +204,13 @@ def _preflight(root: Path) -> None:
     Failing here beats failing on the first image after the user has walked away.
     ``root`` is the run folder's parent — the folder the user picked — because
     the run folder itself is not created until the batch actually starts.
+
+    It must already exist.  Creating it here turned a typo, or the empty mount
+    point of a drive that is not connected, into a real folder on whatever disk
+    lay underneath — and the run then filled that disk instead.
     """
-    try:
-        root.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise ScanError(f"Cannot create the output folder {root}: {exc}") from exc
+    if not root.exists():
+        raise OutputFolderMissing(root)
     if not root.is_dir():
         raise ScanError(f"The output folder is not a directory: {root}")
 
@@ -226,16 +253,18 @@ def _label(path: Path, root: Path) -> str:
         return str(path)
 
 
-def _walk(root: Path, recursive: bool, warnings: list[str]) -> list[Path]:
+def _walk(root: Path, recursive: bool, warnings: list[str]) -> tuple[list[Path], int]:
     """Every file and folder under ``root``, sorted, with a warning per skip.
 
     ``Path.glob`` passed over unreadable folders and linked folders without a
     word, and each then turned up in the mirror as an empty folder that looked
     complete.  Linked folders are still not followed — that way lie loops and
-    trees outside the input — but now the user is told.
+    trees outside the input — but now the user is told.  Also returns how many
+    folders were skipped.
     """
     found: list[Path] = []
     unreadable: set[Path] = set()
+    links = 0
 
     def report(error: OSError) -> None:
         folder = Path(error.filename) if error.filename else root
@@ -250,6 +279,7 @@ def _walk(root: Path, recursive: bool, warnings: list[str]) -> list[Path]:
         kept = []
         for name in dirnames:
             if _is_link(here / name):
+                links += 1
                 if recursive:
                     warnings.append(
                         f"skipped the linked folder {_label(here / name, root)}; links "
@@ -260,7 +290,7 @@ def _walk(root: Path, recursive: bool, warnings: list[str]) -> list[Path]:
         dirnames[:] = kept if recursive else []
         found.extend(here / name for name in kept)
         found.extend(here / name for name in filenames)
-    return sorted(path for path in found if path not in unreadable)
+    return sorted(path for path in found if path not in unreadable), len(unreadable) + links
 
 
 def scan_spec(spec: ScanSpec) -> ScanResult:
@@ -272,6 +302,11 @@ def scan_spec(spec: ScanSpec) -> ScanResult:
     # The run folder does not exist yet, so the writability check has to happen
     # on its parent — which is the folder the user actually nominated anyway.
     _preflight(spec.output_root.parent)
+    if (spec.input_folder / runfolder.MARKER_NAME).is_file():
+        warnings.append(
+            f"the input folder holds {runfolder.MARKER_NAME}: it is a minjpg run that "
+            "never finished, so files may be missing from it"
+        )
 
     jobs: list[Job] = []
     skipped: list[Path] = []
@@ -303,8 +338,8 @@ def scan_spec(spec: ScanSpec) -> ScanResult:
     def place(
         source: Path, target_dir: Path, name: str, action: str,
         fallback_dir: Path | None = None,
-    ) -> None:
-        """Queue one job, resolving clashes and refusing self-overwrites.
+    ) -> Job | None:
+        """One job, with clashes resolved; ``None`` if it would overwrite something.
 
         ``fallback_dir`` is where the original goes if it cannot be processed.
         """
@@ -314,7 +349,7 @@ def scan_spec(spec: ScanSpec) -> ScanResult:
         # is the last place that would notice.
         if _same_file(target_dir / name, source):
             warnings.append(f"skipped {source.name}: the output would overwrite the source")
-            return
+            return None
 
         output = claim(target_dir, name, source)
         if output.exists():
@@ -322,7 +357,7 @@ def scan_spec(spec: ScanSpec) -> ScanResult:
             # ever does, skipping is the one answer that destroys nothing.
             warnings.append(f"skipped {source.name}: {output.name} already exists in the new folder")
             skipped.append(source)
-            return
+            return None
         fallback = None
         if fallback_dir is not None:
             # A source that keeps its own name (photo.jpg -> photo.jpg) falls
@@ -332,7 +367,6 @@ def scan_spec(spec: ScanSpec) -> ScanResult:
                 fallback = output
             else:
                 fallback = claim(fallback_dir, same_name(source), source, quiet=True)
-        jobs.append(Job(source=source, output=output, action=action, fallback=fallback))
         used_dirs.add(target_dir)
         try:
             size = source.stat().st_size
@@ -341,26 +375,40 @@ def scan_spec(spec: ScanSpec) -> ScanResult:
         # Copies cost their real size; a full-tree copy can be gigabytes, which
         # the processed-output estimate would badly understate.
         estimated += size if action == COPY else (spec.space_per_job or size)
+        return Job(source=source, output=output, action=action, fallback=fallback)
 
     files: list[tuple[Path, Path, bool]] = []  # (path, mirror dir, is a source image)
-    for path in _walk(spec.input_folder, spec.recursive, warnings):
+    min_copies = 0
+    unused: set[str] = set()
+    unused_count = not_regular = left_out = 0
+    paths, skipped_folders = _walk(spec.input_folder, spec.recursive, warnings)
+    for path in paths:
         if path.is_dir():
             # Non-recursive runs never look inside these, so mirroring them
             # would promise a copy of a folder whose contents we ignored.
-            if spec.recursive and (spec.copy_extras or spec.copy_sources):
+            if not spec.recursive:
+                left_out += 1
+            elif spec.copy_extras or spec.copy_sources:
                 seen_dirs.add(path)
             continue
         if not path.is_file():
-            continue  # sockets, broken symlinks, device nodes: not ours to copy
+            not_regular += 1  # sockets, broken symlinks, device nodes: nothing to copy
+            continue
 
         try:
             relative_parent = path.parent.relative_to(spec.input_folder)
         except ValueError:
             continue
 
-        is_source = path.suffix.lower() in spec.extensions
+        suffix = path.suffix.lower()
+        appledouble = path.name.startswith(_APPLEDOUBLE_PREFIX)
+        is_source = suffix in spec.extensions and not appledouble
         if is_source and spec.exclude_min and is_min_file(path):
             is_source = False  # never treat our own results as new source material
+            min_copies += 1
+        elif suffix in spec.report_unused and not appledouble:
+            unused.add(suffix)
+            unused_count += 1
         files.append((path, spec.output_root / relative_parent, is_source))
 
     # Copies are placed first so a file keeps the name it already had.  The two
@@ -370,22 +418,58 @@ def scan_spec(spec: ScanSpec) -> ScanResult:
     # generated file — renaming the user's own file instead would be surprising,
     # and the copy would no longer sit where its original did.
     for path, mirror_dir, is_source in files:
-        if is_source and spec.copy_sources:
-            place(path, mirror_dir, same_name(path), COPY)
-        elif not is_source and spec.copy_extras:
-            place(path, mirror_dir, same_name(path), COPY)
+        if (spec.copy_sources if is_source else spec.copy_extras):
+            if job := place(path, mirror_dir, same_name(path), COPY):
+                jobs.append(job)
 
-    for path, mirror_dir, is_source in files:
-        if not is_source:
-            continue
+    # Processed outputs claim their names JPEGs first, for the same reason: in
+    # an iPhone folder IMG_1234.HEIC sorts before IMG_1234.JPG, and used to take
+    # IMG_1234.jpg, pushing the user's own JPEG to IMG_1234-2.jpg.  The list
+    # itself stays in folder order.
+    sources = [(index, path, mirror_dir) for index, (path, mirror_dir, is_source)
+               in enumerate(files) if is_source]
+    placed: dict[int, Job] = {}
+    for index, path, mirror_dir in sorted(
+        sources, key=lambda item: item[1].suffix.lower() not in formats.JPEG_EXTENSIONS
+    ):
         processed_dir = (
             spec.output_root / spec.subdir / mirror_dir.relative_to(spec.output_root)
             if spec.subdir
             else mirror_dir
         )
-        place(
+        if job := place(
             path, processed_dir, spec.output_name(path), PROCESS,
             fallback_dir=mirror_dir if spec.fallback_copy else None,
+        ):
+            placed[index] = job
+    jobs.extend(placed[index] for index in sorted(placed))
+
+    if spec.report_min_copies and min_copies:
+        warnings.append(
+            f"{min_copies} file(s) named like finished thumbnails (*_min.jpg) are copied "
+            "as they are, not compressed"
+        )
+    if unused_count:
+        warnings.append(
+            f"{unused_count} image(s) get no thumbnail: this tab does not read "
+            f"{', '.join(sorted(unused))} files"
+        )
+    if not_regular:
+        warnings.append(
+            f"{not_regular} item(s) that are not ordinary files (broken links, sockets...) "
+            "are not copied"
+        )
+    # A folder meant to mirror the input is checked against it once the run
+    # is over, and anything it lacks keeps it marked incomplete.  Better to
+    # know that before starting than to find the marker afterwards.
+    if spec.copy_extras and left_out:
+        warnings.append(f"{left_out} subfolder(s) are left out: 'Include subfolders' is off")
+    if spec.copy_extras and (left_out or skipped_folders):
+        # First, with only low disk space ahead of it: the Start dialog shows
+        # the first few warnings and puts the rest in the log.
+        warnings.insert(0,
+            "the new folder cannot hold everything in the input, so it will stay marked "
+            f"incomplete: {runfolder.MARKER_NAME} in it will list what is missing"
         )
 
     # Folders that contributed no files still belong in a full mirror.
@@ -409,6 +493,7 @@ def scan_spec(spec: ScanSpec) -> ScanResult:
         warnings=warnings,
         empty_dirs=empty_dirs,
         low_space=low_space,
+        mirror=spec.copy_extras,
     )
 
 
@@ -445,6 +530,9 @@ def scan_min(input_folder: Path, run_root: Path, settings: Settings) -> ScanResu
             copy_sources=beside,
             copy_extras=beside,
             space_per_job=settings.size_hard_cap,
+            # HEIC, GIF and the like: the Compress tab reads them, this one does
+            # not, and a folder of iPhone photos otherwise scans as "0 to compress".
+            report_unused=formats.source_extensions() - settings.source_extensions(),
         )
     )
 
@@ -476,5 +564,6 @@ def scan_compress(
             copy_sources=False,  # the compressed JPEG replaces the original
             copy_extras=True,
             fallback_copy=True,  # an image that cannot be converted is copied as-is
+            report_min_copies=True,
         )
     )

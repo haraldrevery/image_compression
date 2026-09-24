@@ -119,12 +119,14 @@ def create(reserved: RunPlan) -> RunPlan:
     """
     current = reserved
     for _ in range(_MAX_ATTEMPTS):
-        try:
-            current.parent.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
+        # The folder the user picked must still be there.  Re-creating it would
+        # put a drive unplugged since the scan back as an empty folder on the
+        # disk underneath, and fill that disk instead.
+        if not current.parent.is_dir():
             raise RunFolderError(
-                f"Cannot create the output folder {current.parent}: {exc}"
-            ) from exc
+                f"The output folder {current.parent} is not there any more. If it is "
+                "on a removable or network drive, check that it is connected."
+            )
         try:
             current.path.mkdir()
         except FileExistsError:

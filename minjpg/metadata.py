@@ -1,11 +1,15 @@
-"""Carrying XMP and IPTC across a conversion, alongside the EXIF.
+"""Reading metadata out of a source, and carrying XMP and IPTC across.
 
 cjpeg's output carries no metadata at all, so whatever the source had must be
-spliced back in.  EXIF is handled in :mod:`minjpg.convert`; this module adds the
-other two places photo software keeps what people type in: XMP — Lightroom,
-Bridge, Capture One, darktable and the like write captions, keywords, ratings
-and colour labels there — and IPTC-IIM, the older caption and keyword block
-many of the same apps still write alongside it.
+spliced back in.  Reading all three blocks happens here — EXIF, XMP, which
+Lightroom, Bridge, Capture One, darktable and the like use for captions,
+keywords, ratings and colour labels, and IPTC-IIM, the older caption and keyword
+block many of the same apps still write alongside it.  Writing the EXIF back is
+left to :mod:`minjpg.convert`, which knows the output's size; XMP and IPTC are
+written here.
+
+Anything a source holds that cannot be carried is reported by name rather than
+dropped quietly.
 """
 
 from __future__ import annotations
@@ -13,7 +17,7 @@ from __future__ import annotations
 import re
 import xml.etree.ElementTree as ET
 
-from PIL import Image, IptcImagePlugin
+from PIL import ExifTags, Image, IptcImagePlugin
 
 #: JPEG markers for the segments written here.
 APP1, APP13 = 0xE1, 0xED
@@ -45,8 +49,112 @@ _BULKY = {
 _PADDING = re.compile(r"\s+(<\?xpacket end=)")
 _NAMESPACE = re.compile(r'xmlns:([\w.-]+)\s*=\s*["\']([^"\']+)["\']')
 
+#: The EXIF sub-directories: the camera block (exposure, lens, date taken),
+#: GPS, and the interoperability block the camera block points to.
+_EXIF_IFD, _GPS_IFD, _INTEROP_IFD = 0x8769, 0x8825, 0xA005
+
+#: A TIFF's own first-directory tags that belong in a JPEG's EXIF.  A TIFF keeps
+#: its EXIF in the same directory that describes the file itself, so only these
+#: descriptive ones come across; the camera block and GPS follow whole.
+_TIFF_DESCRIPTIVE = frozenset({
+    269, 270,  # DocumentName, ImageDescription
+    271, 272,  # Make, Model
+    274,  # Orientation (reset to 1 on the way out, once the rotation is baked in)
+    282, 283, 296,  # XResolution, YResolution, ResolutionUnit
+    285,  # PageName
+    305, 306,  # Software, DateTime
+    315, 316,  # Artist, HostComputer
+    18246, 18249,  # Rating, RatingPercent, as Windows writes them
+    33432,  # Copyright
+    40091, 40092, 40093, 40094, 40095,  # Windows title, comment, author, keywords, subject
+})
+
+#: TIFF tags that describe the file's own layout, or data that is carried some
+#: other way.  Leaving these behind loses nothing anyone wrote; any other tag
+#: left behind is named in the result.
+_TIFF_STRUCTURE = frozenset({
+    254, 255, 256, 257, 258, 259, 262, 263, 266, 273, 277, 278, 279, 280, 281,
+    284, 292, 293, 297, 301, 317, 318, 319, 320, 321, 322, 323, 324, 325, 330,
+    332, 338, 339, 340, 341, 347, 512, 513, 514, 515, 517, 518, 519, 520, 521,
+    529, 530, 531, 532,
+    700,  # XMP, read on its own
+    33723,  # IPTC, read on its own
+    34377,  # Photoshop's resources
+    34675,  # ICC profile, applied to the pixels
+    37724,  # Photoshop's layers
+    50341,  # PrintIM, printer settings
+})
+
+#: Where a JPEG keeps the part of an XMP packet too big for one segment.
+_EXTENDED_XMP = b"http://ns.adobe.com/xmp/extension/\x00"
+_PNG_RAW_PROFILE = "raw profile type "
+
 
 # ------------------------------------------------------------------ reading
+
+
+def read_exif(image: Image.Image) -> tuple[Image.Exif | None, list[str]]:
+    """The source's EXIF, ready to carry across, and a note for anything left behind.
+
+    Most formats hold EXIF as one block that Pillow hands over whole — PNG
+    also in ImageMagick's hex text form.  A TIFF keeps it among the tags that
+    describe the file itself, so the descriptive ones, the camera block and GPS
+    are lifted into a block of their own.
+    """
+    if image.info.get("exif") or image.info.get("Raw profile type exif"):
+        return image.getexif(), []
+    if image.format != "TIFF":
+        return None, []
+    try:
+        return _tiff_exif(image)
+    except Exception:
+        return None, ["EXIF could not be read"]
+
+
+def _tiff_exif(image: Image.Image) -> tuple[Image.Exif | None, list[str]]:
+    source = image.getexif()
+    lifted = Image.Exif()
+    left_behind = []
+    for tag, value in source.items():
+        if tag in _TIFF_DESCRIPTIVE:
+            lifted[tag] = value
+        elif tag not in _TIFF_STRUCTURE and tag not in (_EXIF_IFD, _GPS_IFD):
+            left_behind.append(ExifTags.TAGS.get(tag, f"tag {tag}"))
+    for pointer in (_EXIF_IFD, _GPS_IFD):
+        if pointer not in source:
+            continue
+        block = dict(source.get_ifd(pointer))
+        if pointer == _EXIF_IFD and _INTEROP_IFD in block:
+            block[_INTEROP_IFD] = dict(source.get_ifd(_INTEROP_IFD))
+        if block:
+            lifted[pointer] = block
+    notes = [f"TIFF tags not carried: {', '.join(left_behind)}"] if left_behind else []
+    if not len(lifted):
+        return None, notes
+    # Serialised and read back, so it behaves exactly like EXIF read from a JPEG.
+    carried = Image.Exif()
+    carried.load(lifted.tobytes())
+    return carried, notes
+
+
+def uncarried_blocks(image: Image.Image) -> list[str]:
+    """A note for each metadata block in the source that cannot be carried across.
+
+    Detected rather than carried: an XMP packet's overflow into extra JPEG
+    segments (almost always depth maps or develop settings, never a caption),
+    and the hex text profiles ImageMagick writes into PNGs for anything but EXIF.
+    """
+    notes = []
+    for marker, data in getattr(image, "applist", None) or ():
+        if marker == "APP1" and data.startswith(_EXTENDED_XMP):
+            notes.append("extended XMP (the overflow of a very large XMP packet) could not be kept")
+            break
+    if image.format == "PNG":
+        for key in image.info:
+            name = key.lower() if isinstance(key, str) else ""
+            if name.startswith(_PNG_RAW_PROFILE) and name != _PNG_RAW_PROFILE + "exif":
+                notes.append(f"PNG '{key[len(_PNG_RAW_PROFILE):]}' profile could not be kept")
+    return notes
 
 
 def _as_bytes(value: object) -> bytes | None:

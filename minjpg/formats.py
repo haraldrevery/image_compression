@@ -42,6 +42,10 @@ _BASE_EXTENSIONS = {
 }
 _HEIF_EXTENSIONS = {".heic", ".heif", ".heics", ".heifs", ".hif", ".avif", ".avifs"}
 
+#: Names a JPEG goes by.  A source with one of these is already the kind of
+#: file the Compress tab writes.
+JPEG_EXTENSIONS = frozenset({".jpg", ".jpeg", ".jpe", ".jfif"})
+
 #: Formats whose extra frames are content — pages or animation — rather than
 #: layers (PSD), sizes (ICO) or a camera's embedded preview image (MPO).
 PAGED_FORMATS = frozenset({"TIFF", "GIF", "WEBP", "PNG"})

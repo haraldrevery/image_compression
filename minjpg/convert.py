@@ -56,6 +56,11 @@ class ConvertResult:
     metadata_kept: bool = False
     notes: str = ""
     kept_metadata: str = ""  # which blocks were carried across, e.g. "EXIF, XMP, IPTC"
+    #: Metadata the source had that the output does not, one note each.  Also
+    #: part of ``notes``; kept apart so the interface can flag the row.
+    lost: list[str] = field(default_factory=list)
+    #: Why the colours may be off when no profile conversion happened, or "".
+    colour_note: str = ""
 
     @property
     def kilobytes(self) -> float:
@@ -84,13 +89,16 @@ class Source:
     xmp: bytes | None = None
     iptc: bytes | None = None
     iptc_digest: bytes | None = None
+    #: Metadata found in the source that cannot be carried, one note each.
+    lost: list[str] = field(default_factory=list)
+    colour_note: str = ""
 
 
 def _as_rgb(image: Image.Image) -> Image.Image:
     return image if image.mode == "RGB" else image.convert("RGB")
 
 
-def to_srgb(image: Image.Image, profile: bytes | None) -> tuple[Image.Image, bool]:
+def to_srgb(image: Image.Image, profile: bytes | None) -> tuple[Image.Image, bool, str]:
     """Convert to sRGB, honouring ``profile`` if there is one.
 
     Without this, a Display P3 or Adobe RGB source is treated as if its numbers
@@ -99,17 +107,26 @@ def to_srgb(image: Image.Image, profile: bytes | None) -> tuple[Image.Image, boo
     cannot apply to RGB, and converting to RGB beforehand made every such
     transform fail — then on RGB, which is all the old code tried.  Broken
     profiles are common in the wild, so a failure here falls back to the raw
-    pixels rather than failing the file.
+    pixels rather than failing the file — and says so.
+
+    Returns the image, whether a profile was converted, and why the colours
+    may be off when one should have been but was not ("" when all is well).
     """
     if not profile:
-        return _as_rgb(image), False
+        note = (
+            "CMYK without a colour profile, converted with a generic formula: "
+            "colours may be off" if image.mode == "CMYK" else ""
+        )
+        return _as_rgb(image), False, note
     try:
         source_profile = ImageCms.ImageCmsProfile(io.BytesIO(profile))
         is_srgb = ImageCms.getProfileDescription(source_profile).strip().startswith("sRGB")
     except Exception:
-        return _as_rgb(image), False  # unusable profile - treat the numbers as sRGB
+        return _as_rgb(image), False, (
+            "its colour profile is damaged, so the colours were read as sRGB and may be off"
+        )
     if is_srgb:
-        return _as_rgb(image), False
+        return _as_rgb(image), False, ""
 
     own = image.mode if image.mode in _PROFILE_MODES else "RGB"
     for mode in dict.fromkeys((own, "RGB")):
@@ -121,8 +138,8 @@ def to_srgb(image: Image.Image, profile: bytes | None) -> tuple[Image.Image, boo
         except Exception:
             continue
         if converted is not None:
-            return converted, True
-    return _as_rgb(image), False
+            return converted, True, ""
+    return _as_rgb(image), False, "its colour profile could not be applied, so colours may be off"
 
 
 def flatten_alpha(image: Image.Image) -> Image.Image:
@@ -148,24 +165,25 @@ def load_source(path: Path) -> Source:
     opened = formats.open_image(path)
     source_format, source_mode = opened.format, opened.mode
     frames = formats.frame_count(opened)
-    exif = opened.getexif() if opened.info.get("exif") else None
+    exif, lost = metadata.read_exif(opened)
     profile = opened.info.get("icc_profile")
     notes = []
     try:
         xmp = metadata.read_xmp(opened)
         iptc, iptc_digest = metadata.read_iptc(opened)
+        lost += metadata.uncarried_blocks(opened)
     except Exception:
         # Metadata that cannot be read must never cost the image itself.
         xmp = iptc = iptc_digest = None
-        notes.append("XMP/IPTC could not be read")
+        lost.append("XMP/IPTC could not be read")
     upright = ImageOps.exif_transpose(opened) or opened
     image = formats.to_8bit(upright)
     if image is not upright:
         notes.append(f"{source_mode} source reduced to 8 bits")
-    srgb, converted = to_srgb(flatten_alpha(image), profile)
+    srgb, converted, colour_note = to_srgb(flatten_alpha(image), profile)
     return Source(
         srgb, exif, converted, source_format, source_mode, frames, notes,
-        xmp=xmp, iptc=iptc, iptc_digest=iptc_digest,
+        xmp=xmp, iptc=iptc, iptc_digest=iptc_digest, lost=lost, colour_note=colour_note,
     )
 
 
@@ -206,12 +224,12 @@ def build_exif_payload(
 
 
 def _metadata_segments(
-    loaded: Source, size: tuple[int, int], notes: list[str]
+    loaded: Source, size: tuple[int, int], lost: list[str]
 ) -> tuple[list[bytes], list[str]]:
     """The EXIF, XMP and IPTC segments to splice in, and which of them made it.
 
     cjpeg reads PPM, so its output carries no metadata at all.  Anything the
-    user asked to keep that could not be kept is added to ``notes`` rather
+    user asked to keep that could not be kept is added to ``lost`` rather
     than dropped quietly.
     """
     segments: list[bytes] = []
@@ -219,14 +237,14 @@ def _metadata_segments(
     if loaded.exif is not None:
         payload = build_exif_payload(loaded.exif, size, srgb=loaded.converted_colour)
         if payload is None:
-            notes.append("EXIF could not be kept (too large for a JPEG, or unreadable)")
+            lost.append("EXIF could not be kept (too large for a JPEG, or unreadable)")
         else:
             segments.append(metadata.segment(metadata.APP1, payload))
             kept.append("EXIF")
     if loaded.xmp:
         xmp, note = metadata.xmp_segment(loaded.xmp, size, loaded.converted_colour)
         if note:
-            notes.append(note)
+            lost.append(note)
         if xmp:
             segments.append(xmp)
             kept.append("XMP")
@@ -236,7 +254,7 @@ def _metadata_segments(
             segments.append(iptc)
             kept.append("IPTC")
         else:
-            notes.append("IPTC could not be kept (too large for a JPEG)")
+            lost.append("IPTC could not be kept (too large for a JPEG)")
     return segments, kept
 
 
@@ -304,18 +322,25 @@ def convert(
     size = resize.target_size(source_size, cap)
 
     if _can_pass_through(source, settings, size, source_size, long_edge, quality, loaded):
-        copied = copy_atomic(source, output)
+        written = copy_atomic(source, output)
         return ConvertResult(
-            source, output, source_size, source_size, copied,
-            quality=0, copied=True, metadata_kept=True,
-            notes="already within the long edge and size cap",
+            source, output, source_size, source_size, written.byte_size,
+            quality=0, copied=True, metadata_kept=True, lost=list(written.lost),
+            notes="; ".join(["already within the long edge and size cap", *written.lost]),
         )
 
-    frame = resize.resize(image, size, settings.linear_light_resize)
+    try:
+        frame = resize.resize(image, size, settings.linear_light_resize)
+    except MemoryError as exc:
+        # The image is fine, just too big for this machine: carried across as
+        # it is, like any other image that cannot be converted.
+        raise PipelineError("too large to convert with the memory available") from exc
 
     notes = list(loaded.notes)
+    # What could not be kept only matters when keeping was asked for.
+    lost = [] if settings.strip_metadata else list(loaded.lost)
     segments, kept = (
-        ([], []) if settings.strip_metadata else _metadata_segments(loaded, size, notes)
+        ([], []) if settings.strip_metadata else _metadata_segments(loaded, size, lost)
     )
     # The cap applies to the file that lands on disk, metadata and all.
     overhead = sum(len(segment) for segment in segments)
@@ -332,10 +357,18 @@ def convert(
         data = metadata.inject(data, segments)
 
     # The run folder is a mirror of the input, so the file keeps its source's
-    # date: for anything without EXIF, that date is the only one there is.
-    write_atomic(output, data, times_from=source)
+    # date — for anything without EXIF, that date is the only one there is —
+    # and its file-manager tags, unless all metadata is to go.
+    written = write_atomic(
+        output, data, times_from=source,
+        xattrs_from=None if settings.strip_metadata else source,
+    )
+    lost += written.lost
+    notes += lost
     if loaded.converted_colour:
         notes.append("converted to sRGB")
+    if loaded.colour_note:
+        notes.append(loaded.colour_note)
     if over_cap:
         # An override skips the search entirely, so blaming the quality floor
         # would name a quality the file was never encoded at.
@@ -352,6 +385,7 @@ def convert(
         source, output, source_size, size, len(data), used_quality,
         over_cap=over_cap, converted_colour=loaded.converted_colour,
         metadata_kept=bool(kept), kept_metadata=", ".join(kept), notes="; ".join(notes),
+        lost=lost, colour_note=loaded.colour_note,
     )
 
 
@@ -381,7 +415,7 @@ def _can_pass_through(
         return False
     if long_edge is not None or quality is not None:
         return False
-    if source.suffix.lower() not in (".jpg", ".jpeg", ".jpe", ".jfif"):
+    if source.suffix.lower() not in formats.JPEG_EXTENSIONS:
         return False
     if loaded.format not in ("JPEG", "MPO") or loaded.mode not in ("RGB", "L"):
         return False

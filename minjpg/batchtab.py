@@ -8,97 +8,26 @@ shared part lives here; each tab supplies the rest.
 
 from __future__ import annotations
 
-import dataclasses
 import queue
 import threading
-from datetime import datetime
 from pathlib import Path
 from tkinter import BooleanVar, StringVar, filedialog, messagebox, ttk
 import tkinter as tk
-from typing import Callable, Protocol
+from typing import Callable
 
-from PIL import Image, ImageOps, ImageTk
+from PIL import Image, ImageOps, ImageTk, UnidentifiedImageError
 
-from . import formats, runfolder, scanner
-from .common import copy_atomic, is_disk_full
+from . import formats, run, runfolder, scanner
 from .logging_setup import get_logger
+from .run import CopyResult, ResultLike, Worker
 
 PREVIEW_MIN = (240, 180)
 
 #: Row statuses highlighted for a second look.
-ATTENTION = ("over cap", "at floor", "kept original")
+ATTENTION = ("over cap", "at floor", "kept original", "metadata lost", "check colours")
 
-#: Failures listed in the incomplete marker; the log has the rest.
-_MARKER_LIST_LIMIT = 500
-
-
-class ResultLike(Protocol):
-    """What both pipelines' result objects have in common."""
-
-    source: Path
-    output: Path
-    output_size: tuple[int, int]
-    byte_size: int
-    quality: int
-
-    @property
-    def kilobytes(self) -> float: ...
-
-
-class CopyResult:
-    """What a plain file copy reports back, shaped like a pipeline result.
-
-    Copies share the tree, the log and the progress bar with encoded images, so
-    they have to answer the same questions.  Dimensions and quality are not
-    meaningful for an arbitrary file, and the tab renders the blanks as "—".
-    """
-
-    quality = 0
-    output_size = (0, 0)
-
-    def __init__(self, source: Path, output: Path, byte_size: int):
-        self.source = source
-        self.output = output
-        self.byte_size = byte_size
-        #: Set when this copy stands in for an image that could not be
-        #: processed: the original was carried across so nothing is lost.
-        self.kept_reason = ""
-
-    @property
-    def kilobytes(self) -> float:
-        return self.byte_size / 1024
-
-
-def run_copy(job: scanner.Job) -> CopyResult:
-    """Copy one file across.
-
-    ``copy_atomic`` verifies the size before the copy takes its real name, so a
-    copy that ran out of disk part-way fails without leaving a truncated file.
-    """
-    return CopyResult(job.source, job.output, copy_atomic(job.source, job.output))
-
-
-def marker_text(
-    source_root: Path, status: str, failures: list[tuple[str, str]] = ()
-) -> str:
-    """What the incomplete-run marker says."""
-    lines = [
-        "This folder is NOT a complete copy of the input yet.",
-        "",
-        f"Input:    {source_root}",
-        f"Status:   {status}",
-        f"Updated:  {datetime.now():%Y-%m-%d %H:%M}",
-        "",
-        "minjpg deletes this file once every file has been written. While it is",
-        "here, do not delete the originals on the strength of this folder.",
-    ]
-    if failures:
-        lines += ["", f"{len(failures)} file(s) are missing from this folder:"]
-        lines += [f"  {path}: {message}" for path, message in failures[:_MARKER_LIST_LIMIT]]
-        if len(failures) > _MARKER_LIST_LIMIT:
-            lines.append(f"  …and {len(failures) - _MARKER_LIST_LIMIT} more (see minjpg.log)")
-    return "\n".join(lines) + "\n"
-
+#: How many affected files the end-of-run summary names before "…and N more".
+_SUMMARY_NAMES = 5
 
 def _upright(thumb: Image.Image, size: tuple[int, int]) -> tuple[Image.Image, tuple[int, int]]:
     """Turn a preview the way its EXIF says, as every result is turned.
@@ -116,89 +45,6 @@ def _upright(thumb: Image.Image, size: tuple[int, int]) -> tuple[Image.Image, tu
     if turned.size != thumb.size:
         size = (size[1], size[0])
     return turned, size
-
-
-def _relative(path: Path, root: Path) -> str:
-    try:
-        return str(path.relative_to(root))
-    except ValueError:
-        return path.name
-
-
-class Worker(threading.Thread):
-    """Runs a batch off the UI thread, reporting progress over a queue.
-
-    Every event names the tree row it belongs to.  The tallies are written only
-    by this thread and read by the UI once the final ``("finished", worker)``
-    event arrives, which the queue delivers after everything else.
-    """
-
-    def __init__(
-        self,
-        rows: list[tuple[str, scanner.Job]],
-        run_one: Callable[[scanner.Job], ResultLike],
-        events: queue.Queue,
-        source_root: Path,
-        run_root: Path,
-    ):
-        super().__init__(daemon=True)
-        self.rows = rows
-        self.run_one = run_one
-        self.events = events
-        self.source_root = source_root
-        self.run_root = run_root
-        self.cancelled = threading.Event()
-        self.total = len(rows)
-        self.processed = self.done = self.kept = 0
-        #: Row id -> (source, why) for everything missing from the run folder.
-        self.failed_rows: dict[str, tuple[Path, str]] = {}
-        self.stop_reason: str | None = None
-
-    def run(self) -> None:
-        try:
-            for index, (iid, job) in enumerate(self.rows):
-                if self.cancelled.is_set() or self.stop_reason:
-                    break
-                self.events.put(("progress", self, iid, index, self.total, job.source.name))
-                self._run_job(iid, job)
-                self.processed = index + 1
-        finally:
-            self.events.put(("finished", self))
-
-    def _run_job(self, iid: str, job: scanner.Job) -> None:
-        try:
-            result = run_copy(job) if job.action == scanner.COPY else self.run_one(job)
-        except Exception as exc:  # one bad file must not stop the batch
-            if job.fallback is not None and not is_disk_full(exc):
-                self._keep_original(iid, job, exc)
-            else:
-                self._fail(iid, job, exc, str(exc))
-        else:
-            self.done += 1
-            self.events.put(("done", iid, result))
-
-    def _keep_original(self, iid: str, job: scanner.Job, reason: Exception) -> None:
-        """Carry the original across in place of an image that cannot be converted.
-
-        The run folder is meant to be a full copy of the input; dropping the
-        file would leave a hole nobody notices until the originals are gone.
-        """
-        stand_in = dataclasses.replace(job, output=job.fallback, action=scanner.COPY)
-        try:
-            result = run_copy(stand_in)
-        except Exception as exc:
-            self._fail(iid, job, exc, f"{reason}; copying the original instead also failed: {exc}")
-            return
-        result.kept_reason = str(reason)
-        self.kept += 1
-        self.events.put(("kept", iid, result))
-
-    def _fail(self, iid: str, job: scanner.Job, exc: Exception, message: str) -> None:
-        self.failed_rows[iid] = (job.source, message)
-        # ...except a full disk: every later file would fail the same way.
-        if is_disk_full(exc):
-            self.stop_reason = "the output disk is full"
-        self.events.put(("failed", iid, job.source.name, message))
 
 
 class BatchTab(ttk.Frame):
@@ -361,12 +207,15 @@ class BatchTab(ttk.Frame):
         )
 
     def describe_copy(self, result: CopyResult) -> tuple[str, str]:
+        lost = "".join(f" — {note}" for note in result.lost)
         if result.kept_reason:
             return "kept original", (
                 f"{result.source.name} -> original copied unchanged as "
-                f"{result.output.name} instead ({result.kept_reason})"
+                f"{result.output.name} instead ({result.kept_reason}){lost}"
             )
-        return "copied", f"{result.source.name} -> copied unchanged, {result.kilobytes:.1f} KB"
+        return "copied", (
+            f"{result.source.name} -> copied unchanged, {result.kilobytes:.1f} KB{lost}"
+        )
 
     def scan_label(self, result: scanner.ScanResult) -> str:
         label = f"{result.to_process} to {self.verb}"
@@ -484,7 +333,8 @@ class BatchTab(ttk.Frame):
             return False
         messagebox.showinfo(
             "Still running",
-            "A batch is running. Wait for it to finish, or press Cancel first.",
+            "A batch or a single-image re-do is still running.\n"
+            "Wait for it to finish (a batch can also be stopped with Cancel).",
         )
         return True
 
@@ -505,6 +355,12 @@ class BatchTab(ttk.Frame):
         try:
             self.run_plan = self.plan_run_folder()
             result = self.perform_scan()
+        except scanner.OutputFolderMissing as exc:
+            self.run_plan = None
+            self.scan_result = None
+            if self._offer_to_create(exc.folder):
+                self.scan()  # once more, now that it is there
+            return
         except scanner.ScanError as exc:
             self.run_plan = None
             self.scan_result = None
@@ -519,6 +375,47 @@ class BatchTab(ttk.Frame):
 
         self._show_scan(result)
 
+    def _offer_to_create(self, folder: Path) -> bool:
+        """Ask before creating a missing output folder, naming it in full.
+
+        Never done unasked: a typo, or the empty mount point of a drive that is
+        not connected, would otherwise become a folder on the wrong disk.
+        """
+        if not messagebox.askyesno(
+            "Create the output folder?",
+            f"The output folder does not exist:\n\n    {folder}\n\nCreate it?\n\n"
+            "If it should be on a removable or network drive, check that the drive "
+            "is connected first. Otherwise the folder is created on this computer's "
+            "own disk, and the results go there.",
+            icon="warning",
+        ):
+            self.append_log(f"Scan refused: the output folder does not exist: {folder}")
+            return False
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror("Cannot create the output folder", f"{folder}\n\n{exc}")
+            self.append_log(f"Could not create the output folder {folder}: {exc}")
+            return False
+        self.append_log(f"Created the output folder {folder}")
+        return True
+
+    @staticmethod
+    def row_label(job: scanner.Job, root: Path) -> str:
+        """The row's source, and where it goes when that is not plain to see.
+
+        A clash can rename an output (IMG_1234.HEIC -> IMG_1234-2.jpg), and in
+        the "beside" layout an image has two rows, its copy and its thumbnail.
+        Only a changed extension goes unsaid: that is what converting means.
+        """
+        try:
+            label = str(job.source.relative_to(root))
+        except ValueError:
+            label = job.source.name
+        if job.output.stem.casefold() != job.source.stem.casefold():
+            label += f"  →  {job.output.name}"
+        return label
+
     def _show_scan(self, result: scanner.ScanResult) -> None:
         self.scan_result = result
         # Read *after* the scan: perform_scan is what folds the widgets into the
@@ -528,12 +425,8 @@ class BatchTab(ttk.Frame):
         self.rows.clear()
         self.results.clear()
         for job in result.jobs:
-            try:
-                label = str(job.source.relative_to(result.root))
-            except ValueError:
-                label = job.source.name
             iid = self.tree.insert(
-                "", "end", text=label,
+                "", "end", text=self.row_label(job, result.root),
                 values=("to copy" if job.action == scanner.COPY else "pending", "", "", ""),
             )
             self.rows[iid] = job
@@ -593,7 +486,7 @@ class BatchTab(ttk.Frame):
         return True
 
     def start(self) -> None:
-        if self.busy():
+        if self.refuse_while_busy():
             return
         if not self.ensure_ready():
             return
@@ -639,25 +532,15 @@ class BatchTab(ttk.Frame):
                 return
 
         self.append_log(f"Created {created.path}")
-        # Written first and removed last: whatever stops this run — Cancel, a
-        # crash, a power cut, the window closing — the folder says it is not a
-        # complete copy.  Failing to write it is the last writability check.
         try:
-            runfolder.write_marker(created.path, marker_text(
-                self.scan_result.root,
-                "started, not finished - if minjpg is no longer running, the run "
-                "was interrupted (the app closed, crashed or lost power)",
-            ))
+            notes = run.begin(created.path, self.scan_result)
         except OSError as exc:
             runfolder.discard_empty_tree(created.path)
             messagebox.showerror("Cannot start", f"Cannot write into {created.path}:\n{exc}")
             self.append_log(f"Start refused: {exc}")
             return
-        try:
-            for directory in self.scan_result.empty_dirs:
-                directory.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            self.append_log(f"  note: could not mirror an empty folder: {exc}")
+        for note in notes:
+            self.append_log(note)
 
         for iid in self.rows:
             self.tree.set(iid, "status", "queued")
@@ -668,7 +551,7 @@ class BatchTab(ttk.Frame):
 
         self.worker = Worker(
             list(self.rows.items()), self.run_one, self.events,
-            self.scan_result.root, created.path,
+            self.scan_result.root, created.path, audit=self.scan_result.mirror,
         )
         self.worker.start()
 
@@ -842,62 +725,24 @@ class BatchTab(ttk.Frame):
             f"originals, {len(worker.failed_rows)} failed"
             + (f" — {worker.stop_reason}" if worker.stop_reason else "")
         )
-        if worker.done + worker.kept == 0:
-            self._tidy_empty_run(worker)
-        else:
-            self._update_marker(worker)
-        if worker.kept or worker.failed_rows or worker.stop_reason:
-            self._summarise(worker)
+        for item in worker.missing:
+            self.append_log(f"  not in the new folder: {item}")
+        for line in run.settle(worker):
+            self.append_log(line)
+        results = [self.results[iid] for iid, _job in worker.rows if iid in self.results]
+        lost = [result for result in results if getattr(result, "lost", None)]
+        if worker.kept or worker.failed_rows or worker.stop_reason or worker.missing or lost:
+            self._summarise(worker, results, lost)
 
     @staticmethod
-    def _run_complete(worker: Worker) -> bool:
-        return worker.processed == worker.total and not worker.failed_rows
+    def _named(entries: list[str]) -> list[str]:
+        """The first few entries as bullet lines, and how many more there are."""
+        lines = [f"  • {entry}" for entry in entries[:_SUMMARY_NAMES]]
+        if len(entries) > _SUMMARY_NAMES:
+            lines.append(f"  …and {len(entries) - _SUMMARY_NAMES} more (see the log)")
+        return lines
 
-    @staticmethod
-    def _status_line(worker: Worker) -> str:
-        if worker.stop_reason:
-            return (f"stopped after {worker.processed} of {worker.total} files: "
-                    f"{worker.stop_reason}")
-        if worker.processed < worker.total:
-            return f"cancelled after {worker.processed} of {worker.total} files"
-        return f"finished, but {len(worker.failed_rows)} file(s) could not be written"
-
-    def _update_marker(self, worker: Worker) -> None:
-        """Remove the incomplete marker, or rewrite it to say what is missing."""
-        try:
-            if self._run_complete(worker):
-                runfolder.remove_marker(worker.run_root)
-                return
-            failures = [
-                (_relative(source, worker.source_root), message)
-                for source, message in worker.failed_rows.values()
-            ]
-            runfolder.write_marker(
-                worker.run_root,
-                marker_text(worker.source_root, self._status_line(worker), failures),
-            )
-        except OSError as exc:
-            self.append_log(f"  note: could not update {runfolder.MARKER_NAME}: {exc}")
-            return
-        self.append_log(
-            f"  {worker.run_root.name} is marked incomplete: see {runfolder.MARKER_NAME} in it"
-        )
-
-    def _tidy_empty_run(self, worker: Worker) -> None:
-        """Leave nothing behind when a run wrote nothing.
-
-        Only the marker — ours — is deleted outright.  Everything else goes
-        through ``rmdir``, which refuses a folder with anything in it, so a run
-        that did write something is never cleaned up from under the user.
-        """
-        try:
-            runfolder.remove_marker(worker.run_root)
-        except OSError:
-            pass
-        if runfolder.discard_empty_tree(worker.run_root):
-            self.append_log(f"Removed the empty folder {worker.run_root}")
-
-    def _summarise(self, worker: Worker) -> None:
+    def _summarise(self, worker: Worker, results: list[ResultLike], lost: list[ResultLike]) -> None:
         """Say plainly, once, what did not go to plan — the log is easy to miss."""
         lines = []
         if worker.stop_reason:
@@ -907,15 +752,24 @@ class BatchTab(ttk.Frame):
             )
         lines.append(f"{worker.done} file(s) written.")
         if worker.kept:
-            lines.append(
-                f"{worker.kept} image(s) were copied across unchanged instead of "
-                "converted: unreadable, or multi-page and kept whole."
-            )
+            kept = [r for r in results if isinstance(r, CopyResult) and r.kept_reason]
+            lines.append(f"{worker.kept} image(s) were copied across unchanged instead of converted:")
+            lines += self._named([f"{r.source.name}: {r.kept_reason}" for r in kept])
+        if lost:
+            lines.append(f"{len(lost)} file(s) lost some of their metadata on the way:")
+            lines += self._named([f"{r.source.name}: {'; '.join(r.lost)}" for r in lost])
         if worker.failed_rows:
             lines.append(f"{len(worker.failed_rows)} file(s) failed and are NOT in the new folder.")
+        if worker.missing:
+            lines.append(
+                f"{len(worker.missing)} item(s) in the input are NOT in the new folder "
+                "(unreadable or linked folders, subfolders left out, or files added "
+                "during the run):"
+            )
+            lines += self._named(worker.missing)
         if worker.done + worker.kept == 0:
             lines.append("\nNothing was written, so the new folder was removed again.")
-        elif not self._run_complete(worker):
+        elif not run.is_complete(worker):
             lines.append(
                 f"\nThe folder is marked incomplete: {runfolder.MARKER_NAME} "
                 "inside it lists what is missing."
@@ -947,11 +801,12 @@ class BatchTab(ttk.Frame):
 
     def _clear_run_failure(self, iid: str) -> None:
         """A re-do fixed a row the last run failed: keep its marker truthful."""
-        run = self._last_run
-        if run is None or run.failed_rows.pop(iid, None) is None:
+        last = self._last_run
+        if last is None or last.failed_rows.pop(iid, None) is None:
             return
-        if self.run_plan is not None and run.run_root == self.run_plan.path:
-            self._update_marker(run)
+        if self.run_plan is not None and last.run_root == self.run_plan.path:
+            for line in run.update_marker(last):
+                self.append_log(line)
 
     def record_result(self, iid: str, result: ResultLike) -> None:
         self.results[iid] = result
@@ -964,6 +819,12 @@ class BatchTab(ttk.Frame):
             status, message = self.describe_copy(result)
         else:
             status, message = self.describe_result(result)
+        # Metadata that did not survive outranks everything but a kept original;
+        # it used to sit in the log line of a row that just said "done".
+        if getattr(result, "lost", None) and status != "kept original":
+            status = "metadata lost"
+        elif getattr(result, "colour_note", "") and status == "done":
+            status = "check colours"
         self.tree.set(iid, "status", status)
         self.tree.set(iid, "dimensions", (
             f"{result.output_size[0]}x{result.output_size[1]}"
@@ -1025,6 +886,15 @@ class BatchTab(ttk.Frame):
                 thumb, size = _upright(thumb, size)
                 photo = ImageTk.PhotoImage(thumb)
             byte_size = path.stat().st_size  # inside: the file can vanish meanwhile
+        except UnidentifiedImageError:
+            # Notes, videos, sidecars: an error message here read as if
+            # something had gone wrong with the file.
+            try:
+                size_text = f" · {path.stat().st_size / 1024:.1f} KB"
+            except OSError:
+                size_text = ""
+            self._set_preview(label, info, None, f"no preview: not an image the app can read{size_text}")
+            return
         except Exception as exc:
             self._set_preview(label, info, None, f"cannot preview: {exc}")
             return
@@ -1044,8 +914,9 @@ class BatchTab(ttk.Frame):
 
     def append_log(self, message: str) -> None:
         # Mirrored to the log file: the in-app pane dies with the window, and a
-        # support request needs the per-file detail that was in it.
-        get_logger().info("[%s] %s", self.verb, message)
+        # support request needs the per-file detail that was in it.  Tagged by
+        # job, not verb: both tabs "compress", so the verb could not tell them apart.
+        get_logger().info("[%s] %s", self.job_kind, message)
         self.log.configure(state="normal")
         self.log.insert("end", message + "\n")
         self.log.see("end")

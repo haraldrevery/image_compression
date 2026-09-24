@@ -6,16 +6,23 @@ and prints ours vs. the hand-made ``_min.jpg`` next to it, then asserts every
 generated file is inside the hard cap and carries the expected MozJPEG
 settings (ImageMagick quantization table, 4:2:0, progressive, no metadata).
 
+``--synthetic`` runs the same checks on generated photos when the originals are
+not at hand.  Their references are plain Pillow thumbnails, not Squoosh output,
+so the size comparison then means nothing — but every check on the generated
+files still does.
+
 Usage::
 
-    python tools/verify_against_examples.py [--all] [--sample N] [--data DIR]
+    python tools/verify_against_examples.py [--all] [--sample N] [--data DIR | --synthetic]
 """
 
 from __future__ import annotations
 
 import argparse
 import random
+import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -82,16 +89,34 @@ def check_encoding(path: Path, expected_quality: int) -> list[str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data", type=Path, default=DEFAULT_DATA)
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--data", type=Path, default=DEFAULT_DATA)
+    source.add_argument("--synthetic", action="store_true",
+                        help="use generated stand-in photos instead of the originals")
     parser.add_argument("--sample", type=int, default=30)
     parser.add_argument("--all", action="store_true", help="use every original")
     parser.add_argument("--seed", type=int, default=7)
     args = parser.parse_args()
 
-    if not args.data.is_dir():
-        print(f"No such folder: {args.data}", file=sys.stderr)
-        return 2
+    if not args.synthetic:
+        if not args.data.is_dir():
+            print(f"No such folder: {args.data} (pass --data DIR or --synthetic)", file=sys.stderr)
+            return 2
+        return compare(args)
 
+    from samples import make_photos
+
+    scratch = Path(tempfile.mkdtemp(prefix="minjpg-examples-"))
+    try:
+        args.data = make_photos(scratch)
+        print("Generated stand-in photos: the 'squoosh' column is a plain Pillow "
+              "thumbnail, so only the checks below mean anything.\n")
+        return compare(args)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def compare(args: argparse.Namespace) -> int:
     settings = Settings()
     settings.recursive = False
     pairs = [

@@ -3,7 +3,10 @@
 
 Usage::
 
-    python tools/verify_convert.py [--data DIR] [--sample N]
+    python tools/verify_convert.py [--data DIR | --synthetic] [--sample N]
+
+Exit status: 0 all checks passed, 1 a check failed, 2 every check that ran
+passed but some sections were skipped — so this machine did not verify them.
 """
 
 from __future__ import annotations
@@ -24,7 +27,7 @@ from PIL import Image, ImageCms, IptcImagePlugin, JpegImagePlugin, PngImagePlugi
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from minjpg import convert, formats, pipeline, runfolder, scanner  # noqa: E402
-from minjpg.common import PART_SUFFIX, PipelineError, copy_atomic, write_atomic  # noqa: E402
+from minjpg.common import PART_SUFFIX, PipelineError, Written, copy_atomic, write_atomic  # noqa: E402
 from minjpg.config import (  # noqa: E402
     LAYOUT_BESIDE,
     LAYOUT_SUBFOLDER,
@@ -36,6 +39,7 @@ from minjpg.config import (  # noqa: E402
 DEFAULT_DATA = Path(__file__).resolve().parents[2] / "example_data"
 
 failures: list[str] = []
+skipped: list[str] = []
 checks = 0
 
 
@@ -49,6 +53,12 @@ def check(condition: bool, description: str) -> bool:
     return True
 
 
+def skip(what: str) -> None:
+    """Record a section that could not run here, so the result cannot claim it."""
+    skipped.append(what)
+    print(f"  SKIPPED  {what}")
+
+
 def section(title: str) -> None:
     print(f"\n=== {title}")
 
@@ -57,7 +67,7 @@ def section(title: str) -> None:
 
 
 def test_real_originals(data: Path, sample: int, out: Path) -> None:
-    section(f"Real originals from {data.name}")
+    section(f"Sample originals from {data}")
     settings = ConvertSettings(max_long_edge=1600, quality=65, max_size=0)
     sources = [p for p in sorted(data.glob("*.jpg")) if not scanner.is_min_file(p)][:sample]
     print(f"{'file':40}{'source':>14}{'output':>14}{'KB':>8}{'q':>4}  status")
@@ -128,7 +138,7 @@ def test_formats(tmp: Path, out: Path) -> None:
         base.save(heic_path, quality=90)
         made.append(("heic", heic_path))
     else:
-        print("  (HEIC skipped: pillow-heif not installed)")
+        skip("HEIC input: pillow-heif not installed")
 
     for label, path in made:
         try:
@@ -250,7 +260,7 @@ def test_wide_gamut(tmp: Path, out: Path) -> None:
               and 'exif:ColorSpace="1"' in wide_out,
               "the XMP still names the profile the colours were converted away from")
     else:
-        print("  (no wide-gamut ICC profile on this system, skipping)")
+        skip("wide-gamut conversion: no wide-gamut ICC profile on this system")
 
     # An sRGB-tagged image must pass through untouched
     srgb_path = tmp / "srgb.jpg"
@@ -274,7 +284,7 @@ def test_wide_gamut(tmp: Path, out: Path) -> None:
     ):
         found = next((p for p in candidates if Path(p).is_file()), None)
         if not found:
-            print(f"  (no {label} ICC profile on this system, skipping)")
+            skip(f"{label} profile conversion: no {label} ICC profile on this system")
             continue
         tagged = tmp / f"tagged-{label}.jpg"
         Image.new(mode, (600, 400), value).save(
@@ -497,6 +507,192 @@ def test_metadata(tmp: Path, out: Path) -> None:
 
 
 # ------------------------------------------------------- cap and passthrough
+
+
+def test_metadata_losses(tmp: Path, out: Path) -> None:
+    section("Metadata that used to vanish without a word")
+    from samples import camera_exif, lightroom_xmp
+
+    rng = np.random.default_rng(11)
+    image = Image.fromarray(rng.integers(0, 256, (400, 600, 3), dtype=np.uint8))
+    keep = ConvertSettings(max_long_edge=300, quality=70, max_size=0, passthrough=False)
+
+    # A TIFF keeps its EXIF among the tags describing the file itself: the
+    # descriptive ones, the camera block and GPS belong in the JPEG, the
+    # layout tags do not, and anything unknown is named rather than dropped.
+    buffer = io.BytesIO()
+    image.save(buffer, "JPEG", exif=camera_exif())
+    with Image.open(buffer) as carrier:
+        exif = carrier.getexif()
+        exif[18246] = 4  # Rating, as Windows writes it
+        exif[40094] = "harbour;dawn".encode("utf-16-le") + b"\x00\x00"  # XPKeywords
+        exif[65000] = "private"  # a tag nobody knows
+        image.save(tmp / "camera.tif", exif=exif)
+    r = convert.convert(tmp / "camera.tif", out / "camera-tif.jpg", keep)
+    with Image.open(r.output) as written:
+        got = written.getexif()
+        taken = got.get_ifd(0x8769).get(0x9003)
+        gps = got.get_ifd(0x8825)
+    print(f"  TIFF: kept {r.kept_metadata!r}, make={got.get(0x010F)!r} taken={taken!r} "
+          f"gps={bool(gps)} rating={got.get(18246)} lost={r.lost}")
+    check(got.get(0x010F) == "TestMake" and got.get(0x0132) == "2025:07:26 12:00:00",
+          "a TIFF's camera and date must be carried")
+    check(taken == "2025:07:26 11:59:58", f"a TIFF's date taken was lost ({taken!r})")
+    check(len(gps) > 0, "a TIFF's GPS position was lost")
+    check(got.get(18246) == 4 and bool(got.get(40094)), "a TIFF's rating and Windows keywords were lost")
+    check(not {0x0102, 0x0103, 0x0111, 0x0117} & set(got),
+          "the TIFF's own layout tags (strip offsets, compression...) leaked into the JPEG")
+    check(got.get(0x0112) == 1, "orientation must be 1 once the rotation is baked in")
+    check(any("tag 65000" in note for note in r.lost) and "tag 65000" in r.notes,
+          f"an unknown TIFF tag left behind must be named: {r.lost}")
+
+    # ImageMagick writes a PNG's EXIF and IPTC as hex text.  The EXIF comes
+    # across; the IPTC cannot, and says so.
+    def raw_profile(kind: str, data: bytes) -> str:
+        hexed = data.hex()
+        return f"\n{kind}\n{len(data):8d}\n" + "\n".join(
+            hexed[i:i + 72] for i in range(0, len(hexed), 72)) + "\n"
+
+    info = PngImagePlugin.PngInfo()
+    info.add_text("Raw profile type exif", raw_profile("exif", camera_exif().tobytes()))
+    info.add_text("Raw profile type iptc", raw_profile("iptc", b"\x1c\x02\x78\x00\x04test"))
+    image.save(tmp / "magick.png", pnginfo=info)
+    r = convert.convert(tmp / "magick.png", out / "magick.jpg", keep)
+    with Image.open(r.output) as written:
+        got = written.getexif()
+        gps = got.get_ifd(0x8825)
+    print(f"  ImageMagick PNG: kept {r.kept_metadata!r}, lost={r.lost}")
+    check(got.get(0x010F) == "TestMake" and len(gps) > 0,
+          "EXIF in ImageMagick's PNG text form must be carried")
+    check(any("'iptc' profile" in note for note in r.lost), f"a PNG IPTC profile must be named: {r.lost}")
+
+    # The overflow of a huge XMP packet sits in extra JPEG segments.  It is not
+    # carried, but the loss is named and the main packet still comes across.
+    plain = io.BytesIO()
+    image.save(plain, "JPEG", quality=90, xmp=lightroom_xmp())
+    overflow = (b"http://ns.adobe.com/xmp/extension/\x00" + b"0" * 32
+                + (13).to_bytes(4, "big") + (0).to_bytes(4, "big") + b"<x:overflow/>")
+    data = plain.getvalue()
+    (tmp / "extended.jpg").write_bytes(
+        data[:2] + b"\xff\xe1" + (len(overflow) + 2).to_bytes(2, "big") + overflow + data[2:]
+    )
+    r = convert.convert(tmp / "extended.jpg", out / "extended.jpg", keep)
+    with Image.open(r.output) as written:
+        carried = written.info.get("xmp") or b""
+    print(f"  extended XMP: kept {r.kept_metadata!r}, lost={r.lost}")
+    check(any("extended XMP" in note for note in r.lost), f"extended XMP must be named: {r.lost}")
+    check(b"Harbour at dawn" in carried, "the main XMP packet must still be carried")
+    stripped = convert.convert(tmp / "extended.jpg", out / "extended-strip.jpg",
+                               ConvertSettings(max_long_edge=300, max_size=0, strip_metadata=True))
+    check(not stripped.lost, "with 'Remove all metadata' nothing counts as lost")
+
+    # Colours that may be off are said out loud, and only then.
+    notes = {}
+    Image.new("RGB", (300, 200), (40, 120, 200)).save(
+        tmp / "damaged-profile.jpg", icc_profile=b"not-a-profile", quality=95)
+    notes["damaged"] = convert.convert(tmp / "damaged-profile.jpg", out / "damaged.jpg", keep)
+    image.convert("CMYK").save(tmp / "plain-cmyk.jpg", quality=95)
+    notes["cmyk"] = convert.convert(tmp / "plain-cmyk.jpg", out / "plain-cmyk.jpg", keep)
+    Image.new("RGB", (300, 200), (40, 120, 200)).save(
+        tmp / "srgb-tagged.jpg", quality=95,
+        icc_profile=ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes())
+    notes["srgb"] = convert.convert(tmp / "srgb-tagged.jpg", out / "srgb-tagged.jpg", keep)
+    cmyk_profile = next((p for p in CMYK_CANDIDATES if Path(p).is_file()), None)
+    if cmyk_profile:
+        Image.new("RGB", (300, 200), (40, 120, 200)).save(
+            tmp / "wrong-profile.jpg", icc_profile=Path(cmyk_profile).read_bytes(), quality=95)
+        notes["wrong"] = convert.convert(tmp / "wrong-profile.jpg", out / "wrong.jpg", keep)
+    else:
+        skip("colour note for a profile that cannot be applied: no CMYK ICC profile on this system")
+    for label, result in notes.items():
+        print(f"  colour {label}: {result.colour_note!r}")
+    check("damaged" in notes["damaged"].colour_note and notes["damaged"].colour_note in notes["damaged"].notes,
+          "a damaged colour profile must be reported")
+    check("generic formula" in notes["cmyk"].colour_note, "CMYK without a profile must be reported")
+    check(notes["srgb"].colour_note == "", "an sRGB profile is nothing to report")
+    if "wrong" in notes:
+        check("could not be applied" in notes["wrong"].colour_note,
+              "a profile that cannot be applied must be reported")
+
+
+def test_file_tags(tmp: Path, out: Path) -> None:
+    section("File-manager tags (extended attributes)")
+    source = tmp / "tagged.jpg"
+    Image.new("RGB", (300, 200), (90, 140, 200)).save(source, quality=90)
+    try:
+        os.setxattr(source, "user.xdg.tags", b"harbour")
+        os.setxattr(source, "user.baloo.rating", b"8")
+    except (AttributeError, OSError) as exc:
+        skip(f"file-manager tags: no extended attributes on this platform or filesystem ({exc})")
+        return
+
+    def tags(path: Path) -> dict[str, bytes]:
+        return {n: os.getxattr(path, n) for n in os.listxattr(path) if n.startswith("user.")}
+
+    written = copy_atomic(source, out / "tagged-copy.jpg")
+    check(isinstance(written, Written) and written.byte_size == source.stat().st_size
+          and not written.lost, f"copy_atomic reports {written!r}")
+    check(tags(out / "tagged-copy.jpg") == tags(source), "a copy must carry the file-manager tags")
+    keep = ConvertSettings(max_long_edge=100, quality=70, max_size=0)
+    r = convert.convert(source, out / "tagged-converted.jpg", keep)
+    check(tags(r.output) == tags(source), "a converted image must carry the file-manager tags")
+    r = convert.convert(source, out / "tagged-stripped.jpg",
+                        ConvertSettings(max_long_edge=100, quality=70, max_size=0, strip_metadata=True))
+    check(tags(r.output) == {}, "'Remove all metadata' must leave the file-manager tags behind too")
+    r = convert.convert(source, out / "tagged-passthrough.jpg", ConvertSettings(max_long_edge=1000, max_size=0))
+    check(r.copied and tags(r.output) == tags(source), "a passed-through JPEG must keep its tags")
+    print(f"  tags carried: {tags(out / 'tagged-converted.jpg')}")
+
+    # A drive that cannot hold them: the file still lands, and the loss is named.
+    real_setxattr = os.setxattr
+
+    def refuse(*_args, **_kwargs):
+        raise OSError(errno.ENOTSUP, "Operation not supported")
+
+    def no_room(*_args, **_kwargs):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    from minjpg.run import run_copy
+
+    os.setxattr = refuse
+    try:
+        written = copy_atomic(source, out / "untagged-copy.jpg")
+        r = convert.convert(source, out / "untagged-converted.jpg", keep)
+        copied = run_copy(scanner.Job(source, out / "untagged-run.jpg", scanner.COPY))
+    except OSError as exc:
+        check(False, f"a drive that cannot hold tags failed the file itself: {exc}")
+        return
+    finally:
+        os.setxattr = real_setxattr
+    print(f"  refused: {written.lost}")
+    check((out / "untagged-copy.jpg").read_bytes() == source.read_bytes(),
+          "a copy whose tags cannot be kept must still land intact")
+    check(bool(written.lost) and "user.xdg.tags" in written.lost[0], f"the refused tags must be named: {written.lost}")
+    check(any("file-manager tags" in n for n in r.lost) and "file-manager tags" in r.notes,
+          f"a converted image must report tags it could not keep: {r.lost}")
+    check(bool(copied.lost), "a batch copy must report tags it could not keep")
+    # No room for the tags is not a full disk: it must not stop a batch.
+    os.setxattr = no_room
+    try:
+        written = copy_atomic(source, out / "tag-room.jpg")
+        check(bool(written.lost), "tags that did not fit must be reported")
+    except OSError as exc:
+        check(False, f"running out of room for tags failed the copy: {exc}")
+    finally:
+        os.setxattr = real_setxattr
+
+    # Permissions are not copied: a read-only original must not make an output
+    # that a later re-do cannot replace (Windows refuses to replace read-only files).
+    readonly = tmp / "readonly.jpg"
+    shutil.copyfile(source, readonly)
+    readonly.chmod(0o444)
+    try:
+        copy_atomic(readonly, out / "from-readonly.jpg")
+        check(os.access(out / "from-readonly.jpg", os.W_OK), "a copy of a read-only original is read-only")
+    except OSError as exc:
+        check(False, f"copying a read-only original failed: {exc}")
+    finally:
+        readonly.chmod(0o644)
 
 
 def test_cap_and_passthrough(tmp: Path, out: Path) -> None:
@@ -761,6 +957,7 @@ def test_scanner(tmp: Path) -> None:
     section("Scanner rules - compress tab")
     root = tmp / "scan-in"
     build_tree(root, 13)
+    (tmp / "scan-out").mkdir()  # the output folder must exist: scanning never creates it
     run = tmp / "scan-out" / "run"
 
     settings = ConvertSettings(recursive=True)
@@ -878,17 +1075,304 @@ def test_scanner(tmp: Path) -> None:
           "an existing file in the run folder must be skipped, not overwritten")
     check(any("already exists" in w for w in pre_result.warnings), "that skip must be reported")
 
-    # Renamed thumbnails are still thumbnails.
-    for name, expected in (("a_min.jpg", True), ("a_MIN-2.jpg", True), ("a_min-12.png", True),
+    # Renamed thumbnails are still thumbnails - but only JPEGs are, and only
+    # with a clash number, not a year.
+    for name, expected in (("a_min.jpg", True), ("a_MIN-2.jpg", True), ("a_min-12.jpeg", True),
+                           ("a_min-12.png", False), ("trip_min-2024.jpg", False),
                            ("admin.jpg", False), ("a_minimal.jpg", False), ("a-2.jpg", False)):
         check(scanner.is_min_file(Path(name)) == expected,
               f"is_min_file({name}) should be {expected}")
+
+    test_scanner_rules(tmp)
 
     try:
         Settings(max_shrink_rounds=-1).validate()
         check(False, "a negative shrink-round count must be refused")
     except ValueError:
         pass
+
+
+def test_scanner_rules(tmp: Path) -> None:
+    section("Scanner rules - names, lookalikes and the output folder")
+    out = tmp / "rules-out"
+    out.mkdir()
+    tiny = Image.fromarray(np.random.default_rng(15).integers(0, 256, (60, 80, 3), dtype=np.uint8))
+
+    # A real JPEG keeps its name; a file converted into one yields.  BMP sorts
+    # before JPG in uppercase, just as an iPhone's HEIC does.
+    pair = tmp / "rules-pair"
+    pair.mkdir()
+    tiny.save(pair / "IMG_1234.BMP")
+    tiny.save(pair / "IMG_1234.JPG")
+    compressed = scanner.scan_compress(pair, out / "pair", ConvertSettings())
+    names = {j.source.name: j.output.name for j in compressed.jobs}
+    print(f"  compress: {names}")
+    check(names.get("IMG_1234.JPG") == "IMG_1234.jpg" and names.get("IMG_1234.BMP") == "IMG_1234-2.jpg",
+          f"the real JPEG must keep its name: {names}")
+    check([j.source.name for j in compressed.jobs] == ["IMG_1234.BMP", "IMG_1234.JPG"],
+          "the list stays in folder order")
+    by_name = {j.source.name: j for j in compressed.jobs}
+    check(by_name["IMG_1234.BMP"].fallback.name == "IMG_1234.BMP"
+          and by_name["IMG_1234.JPG"].fallback == by_name["IMG_1234.JPG"].output,
+          "each original still falls back onto its own name")
+    thumbs = scanner.scan_min(pair, out / "pair-min", Settings())
+    names = {j.source.name: j.output.name for j in thumbs.jobs}
+    print(f"  thumbnails: {names}")
+    check(names.get("IMG_1234.JPG") == "IMG_1234_min.jpg", f"the JPEG's thumbnail keeps the plain name: {names}")
+
+    # Names that only look like thumbnails are real photos; Mac AppleDouble
+    # files only look like photos.  Neither is silently misfiled.
+    odd = tmp / "rules-odd"
+    odd.mkdir()
+    for name in ("trip_min-2024.png", "trip_min-2024.jpg", "a_min.jpg", "a_min.png"):
+        tiny.save(odd / name)
+    (odd / "._IMG_0001.jpg").write_bytes(b"\x00\x05\x16\x07" + bytes(4000))
+    (odd / "dangling.jpg").symlink_to(tmp / "nowhere.jpg")
+    result = scanner.scan_compress(odd, out / "odd", ConvertSettings())
+    actions = {j.source.name: j.action for j in result.jobs}
+    print(f"  compress actions: {actions}")
+    print(f"  warnings: {result.warnings}")
+    for name in ("trip_min-2024.png", "trip_min-2024.jpg", "a_min.png"):
+        check(actions.get(name) == scanner.PROCESS, f"{name} is a photo and must be compressed")
+    check(actions.get("a_min.jpg") == scanner.COPY, "a finished thumbnail is copied as it is")
+    check(actions.get("._IMG_0001.jpg") == scanner.COPY, "an AppleDouble file is copied, never decoded")
+    check(any("named like finished thumbnails" in w for w in result.warnings),
+          "thumbnails copied rather than compressed must be counted out loud")
+    check(any("not ordinary files" in w for w in result.warnings), "a broken link must be reported")
+    thumbs = scanner.scan_min(odd, out / "odd-min", Settings())
+    check("._IMG_0001.jpg" not in {j.source.name for j in thumbs.jobs},
+          "an AppleDouble file must not become a failed thumbnail")
+
+    # Images the Thumbnails tab cannot read are counted, not passed over.
+    mixed = tmp / "rules-mixed"
+    mixed.mkdir()
+    tiny.save(mixed / "a.jpg")
+    tiny.save(mixed / "b.gif")
+    tiny.save(mixed / "c.psd.png")
+    result = scanner.scan_min(mixed, out / "mixed-min", Settings(jpeg_only=True))
+    print(f"  JPEG-only thumbnails: {result.warnings}")
+    check(any("2 image(s) get no thumbnail" in w and ".gif" in w and ".png" in w for w in result.warnings),
+          f"images this tab does not read must be reported: {result.warnings}")
+
+    # An input that is itself an unfinished run says so.
+    (mixed / runfolder.MARKER_NAME).write_text("left by a run that never finished")
+    result = scanner.scan_compress(mixed, out / "mixed", ConvertSettings())
+    check(any("never finished" in w for w in result.warnings),
+          "an unfinished run used as input must be flagged")
+
+    # The output folder must already exist: a typo, or the mount point of a
+    # drive that is not connected, must not become a folder on the wrong disk.
+    missing = tmp / "rules-not-mounted" / "Backup"
+    try:
+        scanner.scan_compress(pair, missing / "run", ConvertSettings())
+        check(False, "scanning into a missing output folder must be refused")
+    except scanner.OutputFolderMissing as exc:
+        print(f"  missing output refused: {exc}")
+        check(exc.folder == missing, "the refusal names the missing folder")
+    check(not (tmp / "rules-not-mounted").exists(), "scanning created the missing output folder")
+
+    gone = tmp / "rules-unplugged"
+    gone.mkdir()
+    reserved = runfolder.plan(gone, pair, "compress")
+    gone.rmdir()  # the drive went away between Scan and Start
+    try:
+        runfolder.create(reserved)
+        check(False, "creating a run folder in a vanished output folder must be refused")
+    except runfolder.RunFolderError as exc:
+        print(f"  vanished output refused: {str(exc)[:70]}")
+    check(not gone.exists(), "create() recreated the vanished output folder")
+
+
+def test_run_lifecycle(tmp: Path) -> None:
+    section("Run lifecycle - when a run folder may call itself complete")
+    import queue
+
+    from minjpg import resize, run
+    from minjpg.encoder import EncoderError
+
+    out = tmp / "life-out"
+    out.mkdir()
+    settings = ConvertSettings(max_long_edge=200, max_size=0)
+
+    def convert_one(job):
+        return convert.convert(job.source, job.output, settings)
+
+    def execute(root, run_one=convert_one, spec_settings=settings, kind="compress"):
+        """Scan, begin, work and settle, the way a tab drives a run."""
+        reserved = runfolder.plan(out, root, kind)
+        if kind == "compress":
+            result = scanner.scan_compress(root, reserved.path, spec_settings)
+        else:
+            result = scanner.scan_min(root, reserved.path, spec_settings)
+        created = runfolder.create(reserved)
+        run.begin(created.path, result)
+        rows = [(str(i), job) for i, job in enumerate(result.jobs)]
+        worker = run.Worker(rows, run_one, queue.Queue(), result.root, created.path,
+                            audit=result.mirror)
+        worker.run()
+        run.settle(worker)
+        marker = created.path / runfolder.MARKER_NAME
+        text = marker.read_text(encoding="utf-8") if marker.exists() else ""
+        return worker, text, created.path, result
+
+    def tree(seed: int) -> Path:
+        root = tmp / f"life-in-{seed}"
+        build_tree(root, seed)
+        return root
+
+    worker, marker, _path, _result = execute(tree(40))
+    check(run.is_complete(worker) and not marker and not worker.missing,
+          f"an ordinary run must count as complete (missing={worker.missing})")
+
+    # A broken encoder fails its images instead of filling the folder with
+    # unconverted originals, and three failures in a row stop the run.
+    def broken(job):
+        raise EncoderError("cjpeg failed (exit 1): simulated")
+
+    worker, marker, path, _result = execute(tree(41), broken)
+    print(f"  broken encoder: kept={worker.kept} failed={len(worker.failed_rows)} "
+          f"stop={worker.stop_reason!r}")
+    check(worker.kept == 0, "a broken encoder must not turn images into kept originals")
+    check(len(worker.failed_rows) == 3 and "3 times in a row" in (worker.stop_reason or ""),
+          "three encoder failures in a row must stop the run")
+    check(bool(marker) and "encoder failed" in marker and "not processed" in marker,
+          "the marker must say why the run stopped and what was never processed")
+    check(not (path / "photo.png").exists(), "an original was copied in place of a failed conversion")
+
+    # An image that cannot be converted is still carried across as it is.
+    def unreadable_images(job):
+        raise PipelineError("cannot read: simulated")
+
+    worker, marker, _path, _result = execute(tree(42), unreadable_images)
+    check(worker.kept == 4 and not worker.failed_rows and not marker,
+          f"unreadable images are kept as originals and the mirror is complete "
+          f"(kept={worker.kept}, failed={len(worker.failed_rows)})")
+
+    # Too big for memory is the image's problem, not the encoder's: kept as it is.
+    real_resize = resize.resize
+
+    def exhausted(*_args, **_kwargs):
+        raise MemoryError
+
+    resize.resize = exhausted
+    try:  # a PNG, so it is re-encoded rather than copied as it is
+        convert.convert(tmp / "life-in-40" / "photo.png", out / "memory.jpg", settings)
+        check(False, "running out of memory must raise")
+    except PipelineError as exc:
+        check("memory" in str(exc), f"out of memory is reported as such: {exc}")
+    except MemoryError:
+        check(False, "running out of memory must become a PipelineError, so the original is kept")
+    finally:
+        resize.resize = real_resize
+
+    # A full disk names where it ran out.
+    def full(job):
+        raise OSError(errno.ENOSPC, "No space left on device", "/some/where/photo.jpg")
+
+    worker, marker, _path, _result = execute(tree(43), full)
+    check("/some/where/photo.jpg" in (worker.stop_reason or ""),
+          f"the full-disk stop must name the path: {worker.stop_reason!r}")
+
+    # Checked against the input once the jobs are done: a file added during
+    # the run keeps the folder marked incomplete, and is named.
+    late_root = tree(44)
+    calls = []
+
+    def adds_a_file(job):
+        if not calls:
+            (late_root / "late.txt").write_text("arrived during the run")
+        calls.append(job)
+        return convert_one(job)
+
+    worker, marker, _path, _result = execute(late_root, adds_a_file)
+    print(f"  added during the run: missing={worker.missing}")
+    check(worker.missing == ["late.txt"] and not run.is_complete(worker),
+          "a file added during the run must keep the folder incomplete")
+    check("late.txt" in marker, "the marker names the file that is missing")
+
+    # Folders the scan could not carry are found again by the check.
+    odd = tree(45)
+    (odd / "locked").mkdir()
+    (odd / "locked" / "secret.txt").write_text("x")
+    elsewhere = tmp / "life-elsewhere"
+    elsewhere.mkdir()
+    (odd / "linked").symlink_to(elsewhere, target_is_directory=True)
+    can_lock = os.name != "nt" and os.geteuid() != 0
+    if can_lock:
+        (odd / "locked").chmod(0)
+    try:
+        worker, marker, _path, result = execute(odd)
+    finally:
+        (odd / "locked").chmod(0o755)
+    print(f"  odd folders: missing={worker.missing}")
+    check(any("stay marked incomplete" in w for w in result.warnings[:2]),
+          "the Start dialog must say up front that the folder will stay incomplete")
+    check(any("linked folder" in m for m in worker.missing), "a linked folder must be listed as missing")
+    if can_lock:
+        check(any("could not be read" in m for m in worker.missing),
+              "an unreadable folder must be listed as missing")
+    check(bool(marker), "a mirror missing folders must stay marked incomplete")
+
+    # 'Include subfolders' off: the mirror really is incomplete, and says so.
+    worker, marker, _path, result = execute(tree(46), spec_settings=ConvertSettings(
+        max_long_edge=200, max_size=0, recursive=False))
+    check("sub/clip.bin" in worker.missing and bool(marker),
+          f"subfolders left out keep a mirror incomplete: {worker.missing}")
+    check(any("left out" in w for w in result.warnings), "leaving subfolders out is announced")
+
+    # The thumbnails-only layout is not a mirror, so there is nothing to audit.
+    thumbs = tmp / "life-thumbs"
+    shutil.copytree(tmp / "life-in-40", thumbs)
+    worker, marker, _path, _result = execute(
+        thumbs, lambda job: pipeline.compress(job.source, job.output, Settings()),
+        spec_settings=Settings(), kind="min")
+    check(run.is_complete(worker) and not marker and not worker.missing,
+          "a thumbnails-only run is complete when every thumbnail is written")
+
+    # The folder vanishing mid-run - even re-created by a write in flight, as
+    # an unmounted drive's empty mount point would be - stops the run.
+    vanish_root = tree(47)
+    calls.clear()
+
+    def unplugged(job):
+        calls.append(job)
+        if len(calls) == 1:
+            shutil.rmtree(out / job.output.relative_to(out).parts[0])  # the run folder
+        return convert_one(job)
+
+    worker, _marker, path, _result = execute(vanish_root, unplugged)
+    print(f"  vanished mid-run: stop={worker.stop_reason!r}")
+    check("not there any more" in (worker.stop_reason or "") and len(calls) == 1,
+          "a run folder that vanished mid-run must stop the run at the next file")
+
+    # Cancel lists what never ran; a re-do cannot clear what the check found.
+    calls.clear()
+    holder = {}
+
+    def cancel_after_first(job):
+        calls.append(job)
+        holder["worker"].cancelled.set()
+        return convert_one(job)
+
+    reserved = runfolder.plan(out, tree(48), "compress")
+    result = scanner.scan_compress(tmp / "life-in-48", reserved.path, settings)
+    created = runfolder.create(reserved)
+    run.begin(created.path, result)
+    rows = [(str(i), job) for i, job in enumerate(result.jobs)]
+    holder["worker"] = worker = run.Worker(rows, cancel_after_first, queue.Queue(),
+                                           result.root, created.path, audit=True)
+    worker.run()
+    run.settle(worker)
+    marker = (created.path / runfolder.MARKER_NAME).read_text(encoding="utf-8")
+    # Two copies run first, then one image before the cancel lands: 3 of 6 are left.
+    check(worker.processed == 3 and "cancelled" in marker
+          and "3 file(s) were not processed" in marker,
+          f"a cancelled run's marker lists what was never processed ({worker.processed} done)")
+    worker.not_processed, worker.processed = [], worker.total
+    worker.failed_rows, worker.missing = {}, ["late.txt"]
+    run.update_marker(worker)
+    check((created.path / runfolder.MARKER_NAME).exists(),
+          "a re-do cannot make a folder complete while input items are missing from it")
 
 
 # --------------------------------------------------- thumbnail layouts + safety
@@ -904,6 +1388,7 @@ def test_min_layouts(tmp: Path) -> None:
 
     # ---- layout 1: a _min/ folder holding only the thumbnails
     before = snapshot(root)
+    (tmp / "min-out").mkdir()  # the output folder must exist: scanning never creates it
     run = tmp / "min-out" / "sub-run"
     result = scanner.scan_min(root, run, Settings(min_layout=LAYOUT_SUBFOLDER))
     run.mkdir(parents=True)
@@ -1021,6 +1506,7 @@ def test_preflight(tmp: Path) -> None:
     rng = np.random.default_rng(29)
     Image.fromarray(rng.integers(0, 256, (60, 80, 3), dtype=np.uint8)).save(case_root / "photo.png")
     shutil.copyfile(case_root / "photo.png", case_root / "photo.PNG")
+    (tmp / "case-out").mkdir()
     clash = scanner.scan_spec(scanner.ScanSpec(
         input_folder=case_root,
         output_root=tmp / "case-out" / "run",
@@ -1135,7 +1621,10 @@ def test_atomic_writes(tmp: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data", type=Path, default=DEFAULT_DATA)
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--data", type=Path, default=DEFAULT_DATA)
+    source.add_argument("--synthetic", action="store_true",
+                        help="use generated stand-in photos instead of a sample folder")
     parser.add_argument("--sample", type=int, default=6)
     args = parser.parse_args()
 
@@ -1146,18 +1635,25 @@ def main() -> int:
     out = tmp / "out"
     out.mkdir()
     try:
+        if args.synthetic:
+            from samples import make_photos
+
+            args.data = make_photos(tmp / "synthetic-samples")
         if args.data.is_dir():
             test_real_originals(args.data, args.sample, out)
         else:
-            print(f"(skipping real originals: {args.data} not found)")
+            skip(f"sample originals: {args.data} not found (pass --data DIR or --synthetic)")
         test_formats(tmp, out)
         test_wide_gamut(tmp, out)
         test_metadata(tmp, out)
+        test_metadata_losses(tmp, out)
+        test_file_tags(tmp, out)
         test_cap_and_passthrough(tmp, out)
         test_run_folder(tmp)
         test_folder_guards(tmp)
         test_scanner(tmp)
         test_min_layouts(tmp)
+        test_run_lifecycle(tmp)
         test_preflight(tmp)
         test_atomic_writes(tmp)
     finally:
@@ -1169,6 +1665,12 @@ def main() -> int:
         for failure in failures:
             print(f"  - {failure}")
         return 1
+    if skipped:
+        print(f"all checks that ran passed, but {len(skipped)} section(s) were SKIPPED "
+              "and are NOT verified on this machine:")
+        for what in skipped:
+            print(f"  - {what}")
+        return 2
     print("all checks passed")
     return 0
 

@@ -32,12 +32,14 @@ used in Squoosh:
 | Progressive, optimized   | `-progressive -optimize`                    |
 | Resize: lanczos3, linearRGB | Lanczos3 filtering in linear light       |
 
-Outputs carry no EXIF and no ICC profile, matching the existing `_min.jpg`
-files.
+Thumbnails carry no EXIF and no ICC profile, matching the existing `_min.jpg`
+files. (The Compress images tab keeps metadata; see below.)
 
 ## Defaults
 
-**Thumbnails** (Settings tab):
+**Thumbnails** (Settings tab). Whatever the fields say is used at the next Scan
+on the Thumbnails tab, which also saves it — there is no separate Apply step to
+forget. **Reset to defaults** asks first.
 
 | Setting            | Value  | Why                                                    |
 | ------------------ | ------ | ------------------------------------------------------ |
@@ -97,8 +99,14 @@ The header always spells out the exact folder that will be created, before you
 press anything. If a folder of that name is somehow already there, the app says
 so and adds `_2`, `_3` and so on — it never writes into a folder that exists.
 
-The output folder cannot be the input folder, cannot sit inside it, and cannot
-contain it; all three are refused with an explanation.
+The output folder must already exist. If it does not, Scan asks before creating
+it, naming it in full and reminding you to connect the drive first if it belongs
+on one — so a typo, or a drive that is not plugged in, never turns into a folder
+on this computer's own disk that quietly fills up.
+
+The output folder cannot be the input folder or sit inside it; both are refused
+with an explanation. It may contain the input — `~/Pictures` as the output for
+`~/Pictures/photos` — because the run folder is always a new one beside it.
 
 ## Using the Thumbnails tab
 
@@ -127,17 +135,21 @@ contain it; all three are refused with an explanation.
 
 3. The status line shows how many images need a `_min.jpg` and how many files
    will be copied. Start says exactly what is about to happen and asks first.
+   HEIC and the other formats only the Compress tab reads are counted in the
+   scan notes rather than passed over in silence: compress them first.
 4. Click any row for an original vs. `_min.jpg` preview with dimensions and size.
 5. Not happy with one? Type a long edge and/or quality under the preview and hit
    **Re-do selected**. A quality override skips the search entirely — it still
    refuses to write anything above the hard cap.
 
-Sources whose name already ends in `_min` — or `_min-2`, `_min-3`…, the names a
-clash produces — are never used as input, so re-running
-over a finished folder does not compress the compressed. In the "next to their
-originals" layout they are still copied across, and if a generated thumbnail
-wants a name an existing file already has, the **existing file keeps its name**
-and the generated one becomes `-2`.
+JPEGs whose name already ends in `_min` — or `_min-2`, `_min-3`…, the names a
+clash produces — are never used as input, so re-running over a finished folder
+does not compress the compressed. Only JPEGs count, and only clash numbers of up
+to three digits, so `trip_min-2024.jpg` is still treated as a photo. In the
+"next to their originals" layout they are still copied across, and if a generated
+thumbnail wants a name an existing file already has, the **existing file keeps
+its name** and the generated one becomes `-2`. Each row shows where its result
+goes (`a.jpg → a_min.jpg`), so an image's copy and its thumbnail are told apart.
 
 ## Using the Compress images tab
 
@@ -159,29 +171,44 @@ What it guarantees:
 - **Everything comes out sRGB.** A Display P3 or Adobe RGB source is converted
   through its embedded profile rather than being reinterpreted, which would leave
   it dull and hue-shifted. CMYK and greyscale profiles are applied to the image in
-  its own colour mode. A corrupt profile falls back to the raw pixels instead of
-  failing the file.
+  its own colour mode. A damaged profile, or one that cannot be applied, falls
+  back to the raw pixels instead of failing the file — and the row says **check
+  colours**, as it does for a CMYK image with no profile at all.
 - **16-bit sources are scaled, not clipped.** A 16-bit greyscale scan becomes the
   same greys in 8 bits rather than solid white, and the row notes the reduction.
-- **Nothing is silently left out.** An image that cannot be read — corrupt, or too
-  large for the decoder — is copied across unchanged instead, and its row says
-  **kept original**. The same happens to multi-frame files, as above.
+- **Nothing is silently left out.** An image that cannot be read — corrupt, too
+  large for the decoder or for the memory available — is copied across unchanged
+  instead, and its row says **kept original**. The same happens to multi-frame
+  files, as above. A broken encoder is a different matter: those images fail and
+  keep the folder marked incomplete, and three encoder failures in a row stop the
+  run, rather than quietly filling the folder with unconverted originals.
 - **File dates are kept.** Copies and compressed files carry their source's
   modification date; for anything without EXIF, that date is the only one there is.
 - **Metadata is kept** unless you tick **Remove all metadata**: EXIF (camera,
   lens, date, exposure, GPS), XMP (captions, keywords, ratings, colour labels and
   develop settings from Lightroom, Bridge, Capture One, darktable and the like)
-  and IPTC (the older caption and keyword block the same apps still write). What
-  the conversion changes is corrected in all of them: the orientation is reset to
-  1 because the rotation is baked into the pixels, dimensions are updated to the
-  real output size, the colour space says sRGB after a conversion, and stale
-  embedded thumbnails are dropped. A JPEG holds at most 64 KB per block, so XMP
-  that does not fit first loses what nobody typed — Camera Raw develop settings,
-  edit history, thumbnails — and keeps captions, keywords and ratings. Anything
-  that still cannot be kept is named in the row rather than dropped quietly.
+  and IPTC (the older caption and keyword block the same apps still write). A
+  TIFF's camera data, date taken, GPS and Windows ratings and keywords come
+  across too — but not the tags that describe the TIFF file itself — as does EXIF
+  that ImageMagick stored in a PNG as text. File-manager tags — the tags, ratings
+  and comments KDE Dolphin and similar keep beside a file on Linux — travel with
+  every converted image and every copy. What the conversion changes is corrected
+  in all of them: the orientation is reset to 1 because the rotation is baked
+  into the pixels, dimensions are updated to the real output size, the colour
+  space says sRGB after a conversion, and stale embedded thumbnails are dropped.
+  A JPEG holds at most 64 KB per block, so XMP that does not fit first loses what
+  nobody typed — Camera Raw develop settings, edit history, thumbnails — and
+  keeps captions, keywords and ratings. Anything that still cannot be kept — a
+  block too big for a JPEG, the overflow of a huge XMP packet, an IPTC profile
+  stored as PNG text, tags a FAT or exFAT drive cannot hold — marks the row
+  **metadata lost** and is named in the end-of-run dialog.
 - **Subfolders are mirrored**, empty ones included, and if two sources map to
   the same name (`photo.png` and `photo.tif`) the second becomes `photo-2.jpg`
-  rather than overwriting the first.
+  rather than overwriting the first. A real JPEG always keeps its own name: with
+  `IMG_1234.HEIC` and `IMG_1234.JPG` side by side, the JPEG stays `IMG_1234.jpg`
+  and the converted HEIC becomes `IMG_1234-2.jpg`. A renamed output shows its new
+  name on its row. The `._` files a Mac leaves on USB drives are copied as they
+  are, never mistaken for photos.
 - **A JPEG that already fits** both the long edge and the size cap is copied
   verbatim — no generation loss. That is skipped when metadata is being stripped
   or the source needs a colour conversion, since a plain copy would defeat both.
@@ -199,27 +226,45 @@ Both tabs share the same guards, so neither can quietly destroy files:
 - **An existing name is never reused.** If the generated name is already taken —
   by a folder, a file, or even a broken symlink — the app says so and adds a
   numeric suffix. It never writes into something that is already there.
-- **Input and output cannot overlap.** Equal folders, an output inside the input,
-  and an input inside the output are all refused with an explanation.
+- **The output cannot be, or sit inside, the input.** Both are refused with an
+  explanation.
+- **The output folder is never created unasked.** Scan offers to create a missing
+  one; Start refuses if it has gone since the scan.
 - **Results never land on their sources.** Any job whose output would resolve to
   its own input is refused and reported.
 - **A run that writes nothing leaves nothing.** Cancel before the first file, or
   have every image fail, and the empty run folder is removed again. Only ever an
   empty one — a folder with anything in it is never cleaned up.
 - **An unfinished folder says so.** `_minjpg_INCOMPLETE.txt` is written into the
-  new folder before anything else and removed only once every file has been
-  written. Cancel, a failure, a crash, a power cut or closing the app all leave it
-  there, listing what is missing. While it is there, do not delete originals on
-  the strength of that folder. Re-doing a failed image successfully updates it.
+  new folder before anything else and removed only once the run is complete.
+  For a folder meant to mirror the input — the Compress tab, and thumbnails next
+  to their originals — complete means the input has been walked again at the end
+  and everything in it is accounted for. A file added during the run, a folder
+  that could not be read, a linked folder (links are not followed), or subfolders
+  left out with **Include subfolders** off all keep the marker; the Start dialog
+  says so beforehand. Cancel, a failure, a crash, a power cut or closing the app
+  all leave it there too. It lists the files that failed, anything missing from
+  the input and whatever was never processed — except after a crash, which leaves
+  it as written at the start. While it is there, do not delete originals on the
+  strength of that folder. Re-doing a failed image successfully updates it; a
+  re-do cannot clear items missing from the input.
 - **Problems are said out loud.** A run where files failed, were kept as
-  originals, or stopped early ends with a dialog, not just a line in the log.
-  Folders that cannot be read, and linked folders (which are not followed), are
-  listed before Start rather than turning up as empty folders in the mirror.
+  originals, lost metadata, are missing from the mirror, or stopped early ends
+  with a dialog naming them, not just a line in the log. Folders that cannot be
+  read, and linked folders, are listed before Start rather than turning up as
+  empty folders in the mirror.
 - **A full disk stops the run.** The first "no space left" ends the batch instead
-  of failing every remaining file while the disk stays full.
+  of failing every remaining file while the disk stays full, and names the file
+  it could not write — which may be the encoder's temporary file on the system
+  drive rather than anything in the output.
+- **A drive that goes away stops the run.** If the run folder disappears mid-run
+  — an unplugged drive, say — the run stops at the next file instead of carrying
+  on in a folder re-created on the disk underneath.
 - **Copied files are verified before they land.** Every copy is checked against
   its source's size before it takes its real name, so a copy cut short by a full
-  disk fails without leaving a truncated file behind.
+  disk fails without leaving a truncated file behind. Dates and file-manager tags
+  come across; permissions do not, so a read-only original never produces an
+  output that a later re-do cannot replace.
 - **Name clashes are case-insensitive.** `photo.PNG` and `photo.png` become
   `photo.jpg` and `photo-2.jpg` rather than silently colliding on Windows or macOS.
 - **Pre-flight before every batch.** The output folder is probed for writability
@@ -235,9 +280,12 @@ Both tabs share the same guards, so neither can quietly destroy files:
   costs about a millisecond per file on an SSD — noticeable only when copying many
   thousands of small files to a slow USB stick.
 - **Nothing changes mid-run.** While a batch is running, Scan, Browse, Re-do and
-  Apply & save decline rather than repoint the work under way.
+  Start decline rather than repoint the work under way, and the run keeps the
+  settings its scan took: editing a field — on either tab or the Settings tab —
+  changes nothing until the next Scan.
 - **The encoder cannot hang the app.** `cjpeg` is given 120 seconds per image;
-  past that it is stopped and only that one file is marked failed.
+  past that it is stopped and only that one file is marked failed. Three encoder
+  failures in a row stop the run, as every remaining image would fail the same way.
 - **The bundled encoder is verified.** Its SHA-256 is checked against the
   recorded digest before it is ever executed.
 
@@ -255,7 +303,8 @@ Windows), rotating at 1 MB with three kept. That file is what to send with a bug
 report.
 
 To run the two steps in sequence, compress into an output folder, then point the
-Thumbnails tab's input at the run folder that produced.
+Thumbnails tab's input at the run folder that produced. If that folder still
+holds `_minjpg_INCOMPLETE.txt`, Scan warns that it is an unfinished run.
 
 ## Building binaries
 
@@ -268,7 +317,12 @@ Thumbnails tab's input at the run folder that produced.
 
 `--selftest` encodes a generated image with the bundled MozJPEG and confirms the
 result is 4:2:0, progressive and metadata-free — a quick way to prove a fresh
-build found its `cjpeg`.
+build found its `cjpeg`. It then converts a JPEG and a TIFF carrying EXIF, XMP
+and IPTC and checks that all of it survived, so a binary built from older code
+fails its selftest instead of dropping captions and GPS in real use.
+
+`dist/minjpg` is committed, so check it after pulling: an out-of-date build
+reports the same version number but fails that metadata round-trip.
 
 ### Windows, step by step
 
@@ -297,9 +351,9 @@ and clone it, or download the repository as a ZIP and extract it. Avoid a path
 with unusual characters, and keep it reasonably short (e.g. `C:\dev\minjpg`)
 since PyInstaller and long Windows paths do not always mix.
 
-**3. Open PowerShell in the project folder.** In File Explorer, open the
-`image_comp_app` folder, then click the address bar, type `powershell`, and press
-Enter.
+**3. Open PowerShell in the project folder.** In File Explorer, open the folder
+holding `build_windows.ps1`, then click the address bar, type `powershell`, and
+press Enter.
 
 **4. Build.**
 
@@ -324,8 +378,8 @@ dist\minjpg.exe
 .\dist\minjpg.exe --selftest
 ```
 
-It should report the MozJPEG version, the format list, a test encode and a HEIC
-round-trip, ending in `selftest OK`. The app is built windowed, so there is no
+It should report the MozJPEG version, the format list, a test encode, a HEIC
+round-trip and a metadata round-trip, ending in `selftest OK`. The app is built windowed, so there is no
 console to print to — `--selftest` shows the report in a dialog and also writes
 it to `%APPDATA%\minjpg\minjpg.log`.
 
@@ -393,10 +447,19 @@ MozJPEG is BSD/IJG licensed; see `vendor/LICENSE.mozjpeg.md`.
 ## Verifying
 
 ```bash
-.venv/bin/python tools/verify_convert.py              # 211 checks
-.venv/bin/python tools/verify_gui.py                  # 88 checks, needs a display
+.venv/bin/python tools/verify_convert.py              # 277 checks
+.venv/bin/python tools/verify_gui.py                  # 107 checks, needs a display
 .venv/bin/python tools/verify_against_examples.py --all   # _min: all 197 pairs
+.venv/bin/python tools/fingerprint.py --compare FILE  # what changed on disk
 ```
+
+Each suite reads its sample photos from `../example_data`, or from `--data DIR`.
+Without them, add `--synthetic` to run on generated stand-in photos instead.
+
+Read the exit status, not just the last line: **0** means every check passed,
+**1** that a check failed, and **2** that sections were skipped — no sample
+photos, no display, or an ICC profile missing on this machine — so those parts
+were *not* verified. A skipped run never reports success.
 
 `verify_convert.py` covers every input format, wide-gamut colour conversion
 against a real Adobe RGB profile, EXIF keep/strip behaviour, the size cap and
@@ -408,8 +471,15 @@ covers XMP and IPTC carried across from JPEG, PNG, WebP, TIFF and HEIC (captions
 keywords, ratings, with stale facts corrected and oversized packets slimmed),
 16-bit sources, CMYK and greyscale profiles, multi-frame files kept whole,
 content-based passthrough, the fallback names reserved for unreadable images, and
-linked and unreadable folders. It also asserts the source tree is byte-for-byte
-unchanged after a run of each mode.
+linked and unreadable folders. It covers what used to vanish without a word — a
+TIFF's EXIF, EXIF in PNG text, extended XMP, colour profiles that cannot be
+applied, file-manager tags and drives that cannot hold them — as well as the
+naming rules (a real JPEG keeps its name, `trip_min-2024` is a photo, `._` files
+are not), the refusal to create a missing output folder, and the run lifecycle:
+when a broken encoder fails rather than keeps originals, when the check at the
+end keeps a folder marked incomplete, and that a run folder vanishing mid-run
+stops the run. It also asserts the source tree is byte-for-byte unchanged after
+a run of each mode.
 
 `verify_gui.py` drives the real app: it builds both tabs, checks each refuses to
 act until both folders are named, runs every layout, and then asserts the input
@@ -422,13 +492,26 @@ every row in the "beside" layout reports its own result; that a failure, a cance
 and a full disk each leave the incomplete marker (and a successful re-do removes
 it); that an unreadable image is carried across as **kept original**; that one
 bad event cannot freeze a tab; and that an EXIF-rotated photo previews upright.
-It skips itself without a display. Both scripts take `--data DIR` to point at a
-folder of sample JPEGs other than `../example_data`.
+Finally it checks that Settings-tab fields take effect at the next Scan and a run
+keeps the settings its scan took, that Reset and a missing output folder both
+ask first, that renamed outputs, metadata losses and colour doubts show on their
+rows and in the end-of-run dialog, and that tab titles quote no stale numbers.
 
-This compresses real originals from `../example_data` and prints the result
-next to the hand-made Squoosh `_min.jpg`, asserting every generated file is
-inside the hard cap and really carries the ImageMagick quantization table at the
-expected quality, 4:2:0 chroma, progressive coding and no metadata.
+`verify_against_examples.py` compresses real originals from `../example_data`
+and prints the result next to the hand-made Squoosh `_min.jpg`, asserting every
+generated file is inside the hard cap and really carries the ImageMagick
+quantization table at the expected quality, 4:2:0 chroma, progressive coding and
+no metadata. With `--synthetic` the size comparison means nothing, since the
+references are plain Pillow thumbnails, but those assertions still hold.
+
+`fingerprint.py` records everything the app writes for a fixed set of awkward
+inputs, built once under `.verify-out/fingerprint/corpus`: every job, every
+row's outcome, the incomplete-marker verdict, and each output file's hash, date
+and metadata, across both tabs and every layout. It also confirms that no run
+changed the input. Save a baseline before a change with `--save FILE`, then
+`--compare FILE` afterwards: a refactor should report *identical*, and a fix
+should change only what it set out to. Exit status 2 there means the two runs
+are not comparable (different input files or library versions).
 
 Expect the app's files to be **larger than the old ones on average** — that is
 the point of the defaults. Where a photo was hand-shrunk to 600×840 at 38 KB,

@@ -5,11 +5,15 @@
 drives the actual Tkinter app instead — building the tabs, scanning, starting
 batches and inspecting what landed on disk — because the guarantee the user cares
 about ("this cannot touch my originals") is a property of the whole app, not of
-any one function.  Needs a display; skips itself cleanly without one.
+any one function.  Needs a display, and sample photos from ``--data`` or
+``--synthetic``; without either it skips itself and exits with status 2, so a
+skipped run can never pass for a successful one.
 
 Usage::
 
-    python tools/verify_gui.py [--data DIR]
+    python tools/verify_gui.py [--data DIR | --synthetic]
+
+Exit status: 0 all checks passed, 1 a check failed, 2 skipped (nothing verified).
 """
 
 from __future__ import annotations
@@ -96,6 +100,10 @@ class Driver:
                 self.dialogs.append((_kind, str(title), str(message)))
             ))
         mb.askokcancel = lambda *a, **k: True
+        # Yes/no questions (create a folder, reset settings) answer "no" unless
+        # a test says otherwise, and are recorded like the rest.
+        self.questions: list[str] = []
+        mb.askyesno = lambda title="", message="", **_: self.questions.append(str(title)) or False
         real_base_name = runfolder.base_name
         runfolder.base_name = lambda folder, kind, when=None: real_base_name(
             folder, kind, when or self.WHEN
@@ -162,8 +170,7 @@ def test_thumbnail_layouts(driver: Driver) -> None:
     before = snapshot(driver.input)
 
     section(f"Thumbnails, {MIN_SUBDIR}/ layout")
-    driver.app.settings.min_layout = LAYOUT_SUBFOLDER
-    tab.settings = driver.app.settings
+    driver.app.layout_var.set(LAYOUT_SUBFOLDER)  # the Settings tab's radio button
     first = driver.run(tab, "min-subfolder")
     produced = sorted(str(p.relative_to(first.path)) for p in first.path.rglob("*") if p.is_file())
     print(f"        {produced}")
@@ -179,8 +186,7 @@ def test_thumbnail_layouts(driver: Driver) -> None:
     check(any(first.path.rglob("*")), "the first run's folder is untouched")
 
     section("Thumbnails, next-to-originals layout")
-    driver.app.settings.min_layout = LAYOUT_BESIDE
-    tab.settings = driver.app.settings
+    driver.app.layout_var.set(LAYOUT_BESIDE)  # the Settings tab's radio button
     third = driver.run(tab, "min-beside")
     produced = sorted(str(p.relative_to(third.path)) for p in third.path.rglob("*") if p.is_file())
     print(f"        {produced}")
@@ -277,6 +283,16 @@ def test_stale_settings(driver: Driver) -> None:
     for tab in (thumbnails, compress):
         tab.input_var.set(str(driver.input))
         tab.output_var.set(str(driver.output))
+    # Every control below is flipped; later tests must not inherit that.  (They
+    # did: a Compress run left without subfolders passed for complete.)
+    controls = [
+        thumbnails.recursive_var, thumbnails.jpeg_only_var,
+        compress.quality_var, compress.long_edge_var, compress.max_size_var,
+        compress.smoothing_var, compress.strip_var, compress.passthrough_var,
+        compress.recursive_var,
+    ]
+    saved = [var.get() for var in controls]
+    saved_layout = driver.app.layout_var.get()
 
     # Each of these decides either which files are processed or how, and the
     # worker reads them from the settings object the scan filled in — so a
@@ -287,10 +303,9 @@ def test_stale_settings(driver: Driver) -> None:
         (thumbnails, "JPEG sources only",
          lambda: thumbnails.jpeg_only_var.set(not thumbnails.jpeg_only_var.get())),
         (thumbnails, "thumbnail layout (Settings tab)",
-         lambda: setattr(
-             driver.app.settings, "min_layout",
-             LAYOUT_BESIDE if driver.app.settings.min_layout == LAYOUT_SUBFOLDER
-             else LAYOUT_SUBFOLDER,
+         lambda: driver.app.layout_var.set(
+             LAYOUT_BESIDE if driver.app.layout_var.get() == LAYOUT_SUBFOLDER
+             else LAYOUT_SUBFOLDER
          )),
         (compress, "Quality", lambda: compress.quality_var.set("55")),
         (compress, "Max long edge", lambda: compress.long_edge_var.set("2000")),
@@ -321,6 +336,10 @@ def test_stale_settings(driver: Driver) -> None:
     check("Scan again first" in infos, f"Start refused (dialogs seen: {infos})")
     check(not plan.path.exists(), "nothing was created for the stale scan")
     check(not thumbnails.busy(), "no worker was started")
+
+    for var, value in zip(controls, saved):
+        var.set(value)
+    driver.app.layout_var.set(saved_layout)
 
 
 def test_redo_needs_a_run_folder(driver: Driver) -> None:
@@ -427,8 +446,7 @@ def test_reporting_and_markers(driver: Driver) -> list:
     tab = driver.app.thumbnail_tab
     tab.input_var.set(str(driver.input))
     tab.output_var.set(str(driver.output))
-    driver.app.settings.min_layout = LAYOUT_BESIDE
-    tab.settings = driver.app.settings
+    driver.app.layout_var.set(LAYOUT_BESIDE)  # the Settings tab's radio button
     real_run = tab.run_one
     plans = []
 
@@ -533,8 +551,11 @@ def test_reporting_and_markers(driver: Driver) -> list:
     row = next(r for r in ctab.tree.get_children() if ctab.rows[r].source.name == "broken.png")
     check(ctab.tree.set(row, "status") == "kept original",
           f"its row says so ({ctab.tree.set(row, 'status')!r})")
-    check(not (plan.path / runfolder.MARKER_NAME).exists(),
-          "nothing is missing, so there is no incomplete marker")
+    marker_path = plan.path / runfolder.MARKER_NAME
+    check(not marker_path.exists(),
+          "nothing is missing, so there is no incomplete marker"
+          + (f" - it says: {marker_path.read_text(encoding='utf-8')[-300:]!r}"
+             if marker_path.exists() else ""))
     check(any(kind == "showwarning" for kind, _t, _m in driver.dialogs),
           "the user is told an original was kept")
     return plans
@@ -549,6 +570,7 @@ def test_pump_survives(driver: Driver) -> None:
     fake_root.mkdir()
     fake = types.SimpleNamespace(
         stop_reason=None, processed=0, total=0, done=0, kept=0, failed_rows={},
+        missing=[], not_processed=[], rows=[],
         run_root=fake_root, source_root=driver.input, is_alive=lambda: False,
     )
     tab.worker = fake
@@ -595,14 +617,13 @@ def test_preview_and_hint(driver: Driver) -> None:
 
 def test_empty_run_cleanup(driver: Driver) -> None:
     section("A run that writes nothing leaves nothing behind")
-    import minjpg.batchtab as batchtab
+    import minjpg.run as run_module
     from minjpg.config import LAYOUT_BESIDE
 
     tab = driver.app.thumbnail_tab
     tab.input_var.set(str(driver.input))
     tab.output_var.set(str(driver.output))
-    driver.app.settings.min_layout = LAYOUT_BESIDE
-    tab.settings = driver.app.settings
+    driver.app.layout_var.set(LAYOUT_BESIDE)  # the Settings tab's radio button
     tab.confirm_start = lambda: True
 
     def boom(job):
@@ -611,8 +632,8 @@ def test_empty_run_cleanup(driver: Driver) -> None:
     tab.scan()
     driver.pump()
     plan = tab.run_plan
-    saved_copy, saved_run = batchtab.run_copy, tab.run_one
-    batchtab.run_copy, tab.run_one = boom, boom
+    saved_copy, saved_run = run_module.run_copy, tab.run_one
+    run_module.run_copy, tab.run_one = boom, boom
     try:
         tab.start()
         driver.pump()
@@ -620,12 +641,177 @@ def test_empty_run_cleanup(driver: Driver) -> None:
             driver.pump(0.2)
         driver.pump(0.4)
     finally:
-        batchtab.run_copy, tab.run_one = saved_copy, saved_run
+        run_module.run_copy, tab.run_one = saved_copy, saved_run
     check(not plan.path.exists(), f"the empty run folder was removed ({plan.path.name})")
 
     kept = driver.run(tab, "successful")
     check(kept.path.is_dir() and any(kept.path.rglob("*")),
           "a run that did write is never cleaned up")
+
+
+def test_settings_and_reporting(driver: Driver) -> None:
+    section("Settings take effect at Scan; rows and dialogs say what happened")
+    import tkinter.messagebox as mb
+
+    from PIL import Image, PngImagePlugin
+
+    from minjpg import runfolder
+    from minjpg.config import LAYOUT_SUBFOLDER, Settings
+
+    app = driver.app
+    thumbs, compress = app.thumbnail_tab, app.compress_tab
+    notebook = app.nametowidget(thumbs.winfo_parent())
+    titles = [notebook.tab(i, "text") for i in range(len(notebook.tabs()))]
+    check(not any(ch.isdigit() for title in titles for ch in title),
+          f"tab titles quote no numbers that could go stale: {titles}")
+
+    # Settings-tab fields count at the next Scan, with no Apply step to forget.
+    thumbs.input_var.set(str(driver.input))
+    thumbs.output_var.set(str(driver.output))
+    app.layout_var.set(LAYOUT_SUBFOLDER)
+    saved = {name: var.get() for name, var in app.setting_vars.items()}
+    app.setting_vars["size_target"].set("30000")
+    app.setting_vars["size_hard_cap"].set("32000")
+    thumbs.scan()
+    driver.pump()
+    check(app.settings.size_hard_cap == 32000, "the scan saved what the Settings tab says")
+    # Whatever happens to the live settings after the scan, the run it built
+    # uses the copy the scan took: a 16 KB cap set now must not reach it.
+    app.settings.size_target, app.settings.size_hard_cap = 15000, 16000
+    plan = thumbs.run_plan
+    thumbs.confirm_start = lambda: True
+    thumbs.start()
+    driver.pump()
+    while thumbs.busy():
+        driver.pump(0.2)
+    driver.pump(0.3)
+    sizes = [p.stat().st_size for p in plan.path.rglob("*_min.jpg")]
+    largest = max(sizes, default=0)
+    check(bool(sizes) and largest <= 32000,
+          f"a hard cap typed on the Settings tab applies at the next scan (largest {largest})")
+    check(largest > 16000,
+          f"the run used the settings its scan took, not ones changed afterwards (largest {largest})")
+    app.setting_vars["size_hard_cap"].set("33000")
+    check(thumbs.scan_is_stale(), "editing a Settings-tab number after Scan needs another scan")
+    app.setting_vars["size_hard_cap"].set("not a number")
+    driver.dialogs.clear()
+    thumbs.scan()
+    check(any("Hard cap" in message for _k, _t, message in driver.dialogs),
+          f"an invalid Settings-tab value refuses the scan and names the field ({driver.dialogs})")
+    for name, value in saved.items():
+        app.setting_vars[name].set(value)
+
+    # Reset asks first, and changes nothing on "no".
+    app.setting_vars["quality_floor"].set("33")
+    driver.questions.clear()
+    app._reset_settings()
+    check(driver.questions and app.setting_vars["quality_floor"].get() == "33",
+          "Reset to defaults asks first and leaves the fields alone on 'no'")
+    real_ask = mb.askyesno
+    mb.askyesno = lambda *a, **k: True
+    try:
+        app._reset_settings()
+    finally:
+        mb.askyesno = real_ask
+    check(app.setting_vars["quality_floor"].get() == str(Settings().quality_floor),
+          "Reset to defaults resets on 'yes'")
+    for name, value in saved.items():
+        app.setting_vars[name].set(value)
+
+    # A missing output folder is offered, never created unasked.
+    missing = driver.tmp / "not-mounted" / "out"
+    compress.input_var.set(str(driver.input))
+    compress.output_var.set(str(missing))
+    driver.pump(0.5)
+    check("does not exist yet" in compress.destination_var.get(),
+          f"the hint says the output folder is missing ({compress.destination_var.get()!r})")
+    driver.questions.clear()
+    compress.scan()
+    check(driver.questions and not missing.exists() and compress.run_plan is None,
+          "declining leaves no folder behind and no scan")
+    mb.askyesno = lambda *a, **k: True
+    try:
+        compress.scan()
+    finally:
+        mb.askyesno = real_ask
+    check(missing.is_dir() and compress.scan_result is not None,
+          "accepting creates the folder and the scan goes ahead")
+
+    # Rows say where a renamed output went, and losses get a status of their own.
+    odd = driver.tmp / "odd-input"
+    odd.mkdir()
+    photo = next(p for p in sorted(driver.input.glob("*.jpg")))
+    with Image.open(photo) as image:
+        small = image.convert("RGB").resize((300, 200))
+    small.save(odd / "IMG_1.JPG", quality=90)
+    small.save(odd / "IMG_1.BMP")
+    info = PngImagePlugin.PngInfo()
+    info.add_text("Raw profile type iptc", "\niptc\n       4\n74657374\n")
+    small.save(odd / "tagged.png", pnginfo=info)
+    small.convert("CMYK").save(odd / "print.jpg", quality=90)
+    compress.input_var.set(str(odd))
+    compress.output_var.set(str(driver.output))
+    driver.dialogs.clear()
+    driver.run(compress, "labels-and-losses")
+    rows = {compress.tree.item(r, "text"): r for r in compress.tree.get_children()}
+    print(f"        rows: {sorted(rows)}")
+    check("IMG_1.BMP  →  IMG_1-2.jpg" in rows and "IMG_1.JPG" in rows,
+          "a renamed output is shown on its row, and the real JPEG kept its name")
+    lost_row = rows.get("tagged.png")
+    check(lost_row is not None and compress.tree.set(lost_row, "status") == "metadata lost"
+          and "attention" in compress.tree.item(lost_row, "tags"),
+          "a file that lost metadata is flagged on its row")
+    cmyk_row = rows.get("print.jpg")
+    check(cmyk_row is not None and compress.tree.set(cmyk_row, "status") == "check colours",
+          "a file whose colours may be off is flagged on its row")
+    check(any("lost some of their metadata" in message and "tagged.png" in message
+              for _k, _t, message in driver.dialogs),
+          f"the end-of-run dialog names metadata losses ({driver.dialogs})")
+
+    # The Compress tab's run keeps its scan's settings too.
+    compress.scan()
+    driver.pump()
+    app.convert_settings.max_long_edge = 100  # a change the scan never saw
+    plan = compress.run_plan
+    compress.confirm_start = lambda: True
+    compress.start()
+    driver.pump()
+    while compress.busy():
+        driver.pump(0.2)
+    driver.pump(0.3)
+    edges = []
+    for output in plan.path.glob("*.jpg"):
+        with Image.open(output) as written:
+            edges.append(max(written.size))
+    check(bool(edges) and min(edges) > 100,
+          f"the Compress run used the settings its scan took (long edges {sorted(edges)})")
+
+    # In the "beside" layout an image's copy and thumbnail no longer share a label.
+    from minjpg.config import LAYOUT_BESIDE
+    app.layout_var.set(LAYOUT_BESIDE)
+    thumbs.scan()
+    labels = [thumbs.tree.item(r, "text") for r in thumbs.tree.get_children()]
+    check(len(labels) == len(set(labels)), "every row in the 'beside' layout has its own label")
+    app.layout_var.set(LAYOUT_SUBFOLDER)
+
+    # Start during a re-do says why nothing happens.
+    release = threading.Event()
+    blocker = threading.Thread(target=release.wait, daemon=True)
+    blocker.start()
+    compress.redo_worker = blocker
+    infos: list[str] = []
+    real_info = mb.showinfo  # earlier tests replaced the driver's recorder with their own
+    mb.showinfo = lambda title="", message="", **_: infos.append(str(title))
+    try:
+        compress.start()
+    finally:
+        mb.showinfo = real_info
+        release.set()
+        blocker.join()
+        compress.redo_worker = None
+    check("Still running" in infos,
+          f"Start during a re-do explains itself instead of doing nothing ({infos})")
+    check(not (driver.output / runfolder.MARKER_NAME).exists(), "nothing stray was written")
 
 
 def test_nothing_stray(driver: Driver, plans: list) -> None:
@@ -639,22 +825,29 @@ def test_nothing_stray(driver: Driver, plans: list) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data", type=Path, default=DEFAULT_DATA)
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--data", type=Path, default=DEFAULT_DATA)
+    source.add_argument("--synthetic", action="store_true",
+                        help="use generated stand-in photos instead of a sample folder")
     args = parser.parse_args()
 
-    if not args.data.is_dir():
-        print(f"skipping: no sample images at {args.data}")
-        return 0
+    if not args.synthetic and not args.data.is_dir():
+        print(f"SKIPPED: no sample images at {args.data} (pass --data DIR or --synthetic)")
+        return 2
     try:
         import tkinter
 
         probe = tkinter.Tk()
         probe.destroy()
     except Exception as exc:
-        print(f"skipping: no display available ({exc})")
-        return 0
+        print(f"SKIPPED: no display available ({exc})")
+        return 2
 
     tmp = Path(tempfile.mkdtemp(prefix="minjpg-gui-"))
+    if args.synthetic:
+        from samples import make_photos
+
+        args.data = make_photos(tmp / "synthetic-samples")
     driver = Driver(tmp, args.data)
     try:
         test_folders_required(driver)
@@ -668,6 +861,7 @@ def main() -> int:
         test_pump_survives(driver)
         test_preview_and_hint(driver)
         test_empty_run_cleanup(driver)
+        test_settings_and_reporting(driver)
         test_nothing_stray(driver, plans)
     finally:
         driver.close()
